@@ -1,4 +1,4 @@
-name: CI_CD
+name: TRIMCTS_CI_CD
 
 on:
   push:
@@ -31,10 +31,10 @@ jobs:
 
       - name: Run MyPy
         # Install core dependencies needed for MyPy to understand imports,
-        # but skip heavy ones like trianglengin if they cause issues here.
-        # MyPy config should handle ignoring missing imports for them.
+        # including pytest for the tests directory.
+        # MyPy config should handle ignoring missing imports for others.
         run: |
-          pip install numpy pydantic typing-extensions
+          pip install numpy pydantic typing-extensions pytest
           mypy src tests
 
   build_wheels:
