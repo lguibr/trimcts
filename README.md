@@ -1,3 +1,4 @@
+
 [![CI](https://github.com/lguibr/trimcts/actions/workflows/ci.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
 [![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
 [![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- TODO: Add Codecov token -->
@@ -19,6 +20,7 @@
 -   (Planned) Supports MuZero-style evaluation (initial inference + recurrent inference).
 -   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise).
 -   Designed for use with external Python game state objects and network evaluators.
+-   Type-hinted Python API (`py.typed` compliant).
 
 ## 🚀 Installation
 
@@ -28,7 +30,7 @@ pip install trimcts
 
 # For development (from cloned repo root)
 # Ensure you clean previous builds if you encounter issues:
-# rm -rf build/ src/trimcts.egg-info/ dist/
+# rm -rf build/ src/trimcts.egg-info/ dist/ src/trimcts/trimcts_cpp.*.so
 pip install -e .[dev]
 ```
 
@@ -182,9 +184,9 @@ else:
 
 ```
 trimcts/
-├── .github/workflows/      # CI configuration (link to workflow file)
-├── src/trimcts/            # Python package source (link to src/trimcts/README.md if exists)
-│   ├── cpp/                # C++ source code (link to src/trimcts/cpp/README.md if exists)
+├── .github/workflows/      # CI configuration (e.g., ci.yml)
+├── src/trimcts/            # Python package source ([src/trimcts/README.md](src/trimcts/README.md))
+│   ├── cpp/                # C++ source code ([src/trimcts/cpp/README.md](src/trimcts/cpp/README.md))
 │   │   ├── CMakeLists.txt  # CMake build script for C++ part
 │   │   ├── bindings.cpp    # Pybind11 bindings
 │   │   ├── config.h        # C++ configuration struct
@@ -193,8 +195,9 @@ trimcts/
 │   │   └── python_interface.h # C++ helpers for Python interaction
 │   ├── __init__.py         # Exposes public API (run_mcts, configs, etc.)
 │   ├── config.py           # Python SearchConfiguration (Pydantic)
-│   └── mcts_wrapper.py     # Python network interface definition
-├── tests/                  # Python tests (link to tests/README.md if exists)
+│   ├── mcts_wrapper.py     # Python network interface definition
+│   └── py.typed            # Marker file for type checkers (PEP 561)
+├── tests/                  # Python tests ([tests/README.md](tests/README.md))
 │   ├── conftest.py
 │   └── test_alpha_wrapper.py # Tests for AlphaZero functionality
 ├── .gitignore
@@ -231,7 +234,7 @@ pytest
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please follow standard fork-and-pull-request workflow. Ensure tests pass and code adheres to formatting/linting standards (Ruff).
+Contributions are welcome! Please follow standard fork-and-pull-request workflow. Ensure tests pass and code adheres to formatting/linting standards (Ruff, MyPy).
 
 ## 📜 License
 

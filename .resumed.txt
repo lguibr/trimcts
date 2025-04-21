@@ -89,14 +89,16 @@ prune build
 prune dist
 
 File: README.md
-
-# TriMCTS
-
 [![CI](https://github.com/lguibr/trimcts/actions/workflows/ci.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
 [![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
 [![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- TODO: Add Codecov token -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+# TriMCTS
+
+<img src="bitmap.png" alt="TriMCTS Logo" width="300"/>
+
 
 **TriMCTS** is an installable Python package providing C++ bindings for Monte Carlo Tree Search, supporting both AlphaZero and MuZero paradigms, optimized for triangular grid games like the one in `trianglengin`.
 

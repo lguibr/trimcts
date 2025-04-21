@@ -8,8 +8,9 @@ graft tests
 
 # Include project metadata
 include README.md
-include LICENSE # Ensure LICENSE is included
+include LICENSE
 include pyproject.toml
+include src/trimcts/py.typed # Include the py.typed marker file
 
 # Exclude build artifacts and caches
 global-exclude *.py[cod] __pycache__ *.so *.pyd *.dylib *.egg-info CMakeCache.txt CMakeFiles

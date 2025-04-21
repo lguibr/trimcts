@@ -49,7 +49,7 @@ except ImportError:
         def valid_actions(self) -> list[int]:
             return [] if self.is_over() else [0, 1]
 
-        def force_game_over(self, reason: str):  # Add method for testing
+        def force_game_over(self, reason: str) -> None:  # Add method for testing
             print(f"Mock force_game_over: {reason}")
             self._is_over = True
 
@@ -156,7 +156,7 @@ def test_mcts_run_alpha_basic(
     dummy_state: GameState,
     dummy_network: DummyAlphaNetwork,
     search_config: SearchConfiguration,
-):
+) -> None:
     """Test basic MCTS run with AlphaZero interface."""
     search_config.max_simulations = 10
     search_config.dirichlet_alpha = (
@@ -192,7 +192,7 @@ def test_mcts_run_alpha_with_noise(
     dummy_state: GameState,
     dummy_network: DummyAlphaNetwork,
     search_config: SearchConfiguration,
-):
+) -> None:
     """Test MCTS run with Dirichlet noise enabled."""
     search_config.max_simulations = 32  # More sims to see noise effect
     search_config.dirichlet_alpha = 0.5
@@ -219,7 +219,7 @@ def test_mcts_run_on_terminal_state(
     dummy_state: GameState,
     dummy_network: DummyAlphaNetwork,
     search_config: SearchConfiguration,
-):
+) -> None:
     """Test MCTS run starting from a terminal state (should return empty)."""
     # Make the state terminal
     if HAS_TRIANGLENGIN:
@@ -227,7 +227,9 @@ def test_mcts_run_on_terminal_state(
         dummy_state.force_game_over("Forced terminal for test")
     else:
         # Use the mock state's method
-        if hasattr(dummy_state, "force_game_over"):
+        if hasattr(dummy_state, "force_game_over") and callable(
+            getattr(dummy_state, "force_game_over")
+        ):
             dummy_state.force_game_over("Forced terminal for mock test")
         else:
             # Fallback if mock doesn't have force_game_over (it should now)

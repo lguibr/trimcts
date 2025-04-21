@@ -1,5 +1,3 @@
-# File: setup.py
-
 import os
 import re
 import shutil
@@ -175,6 +173,8 @@ setup(
     # Metadata defined in pyproject.toml is preferred
     packages=find_packages(where="src"),
     package_dir={"": "src"},
+    # Include the py.typed file
+    package_data={"trimcts": ["py.typed"]},
     ext_modules=[CMakeExtension("trimcts.trimcts_cpp", sourcedir="src/trimcts/cpp")],
     cmdclass={
         "build_ext": CMakeBuild,
