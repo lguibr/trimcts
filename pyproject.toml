@@ -10,16 +10,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trimcts"
-version = "1.1.1" # Incremented version for batching feature
+version = "1.2.0" # Incremented version for tree reuse feature
 authors = [
   { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
 ]
-description = "High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games"
+description = "High‑performance C++ MCTS (AlphaZero & MuZero) with Tree Reuse for triangular games" # Updated description
 readme = "README.md"
 license = "MIT" # Use SPDX identifier string
 requires-python = ">=3.10"
 classifiers = [
-  "Development Status :: 4 - Beta", # Changed from Alpha to Beta
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: C++",
@@ -27,7 +27,7 @@ classifiers = [
 dependencies = [
   "numpy>=1.20.0",
   "pydantic>=2.0.0",
-  "trianglengin>=2.0.6", # Update dependency if needed
+  "trianglengin>=2.0.6", # Keep dependency up-to-date
 ]
 
 [project.urls]

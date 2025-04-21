@@ -1,8 +1,7 @@
-# File: src/trimcts/__init__.py
 """
 TriMCTS Package
 
-Provides high-performance C++ MCTS bindings for Python.
+Provides high-performance C++ MCTS bindings for Python, supporting tree reuse.
 """
 
 # Import only Python-defined elements here
@@ -16,4 +15,5 @@ __all__ = [
     "MuZeroNetworkInterface",
 ]
 
-__version__ = "0.1.0"
+# Increment version for tree reuse feature
+__version__ = "1.2.0"

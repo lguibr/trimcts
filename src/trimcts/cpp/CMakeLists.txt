@@ -14,6 +14,7 @@ find_package(pybind11 CONFIG REQUIRED)
 set(TRIMCTS_SOURCES
     bindings.cpp
     mcts.cpp
+    mcts_manager.cpp # ADDED missing source file
 )
 
 # Build the pybind11 module

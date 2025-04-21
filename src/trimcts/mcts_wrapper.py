@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable, cast
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .config import SearchConfiguration
 
@@ -7,6 +7,8 @@ logger = logging.getLogger(__name__)
 
 # Type hint for the game state object expected by the network interfaces
 GameState = Any
+# Type hint for the opaque tree handle (using Any for now)
+MctsTreeHandle = Any
 
 # --- Conditional Import for MyPy ---
 if TYPE_CHECKING:
@@ -40,21 +42,47 @@ def run_mcts(
     root_state: GameState,
     network_interface: AlphaZeroNetworkInterface | MuZeroNetworkInterface,
     config: SearchConfiguration,
-) -> dict[int, int]:
+    previous_tree_handle: MctsTreeHandle | None = None,
+    last_action: int = -1,
+) -> tuple[dict[int, int], MctsTreeHandle | None]:
     """
-    Python entry point for running MCTS.
+    Python entry point for running MCTS, supporting tree reuse.
 
-    Returns empty dict immediately if root_state.is_over() is True.
+    Args:
+        root_state: The current game state object.
+        network_interface: The network evaluation interface.
+        config: The MCTS search configuration.
+        previous_tree_handle: Opaque handle to the tree state from the previous step (optional).
+        last_action: The action taken that led to the current root_state (required if previous_tree_handle is provided).
+
+    Returns:
+        A tuple containing:
+            - Visit counts (dict[int, int]) for actions from the root.
+            - An opaque handle to the MCTS tree state after the search (or None if MCTS failed).
+            Returns ({}, None) immediately if root_state.is_over() is True.
     """
     # Terminal-state shortcut
     if not hasattr(root_state, "is_over") or not callable(root_state.is_over):
         raise TypeError("root_state object missing required method: is_over")
     if root_state.is_over():
-        return {}
+        logger.warning("run_mcts called on a terminal state. Returning empty.")
+        return {}, None
 
     # Validate config
     if not isinstance(config, SearchConfiguration):
         raise TypeError("config must be an instance of SearchConfiguration")
+
+    # Validate tree reuse parameters
+    if previous_tree_handle is not None and last_action == -1:
+        logger.warning(
+            "previous_tree_handle provided but last_action is -1. Tree reuse might fail. "
+            "Provide the action that led to the current root_state."
+        )
+    if previous_tree_handle is None and last_action != -1:
+        logger.debug(
+            "last_action provided but no previous_tree_handle. Starting new tree."
+        )
+        last_action = -1  # Ensure last_action is -1 if no handle
 
     # Import the C++ extension
     try:
@@ -95,24 +123,54 @@ def run_mcts(
             "MuZero MCTS integration is not yet implemented in C++ bindings."
         )
 
-    # Call into C++
-    visit_counts = cast(
-        dict[int, int],
-        cpp_module.run_mcts_cpp(root_state, network_interface, config),
-    )
+    # Call into C++ - it now returns a tuple (visit_map, new_handle)
+    try:
+        # Pass None directly if previous_tree_handle is None
+        handle_to_pass = (
+            previous_tree_handle if previous_tree_handle is not None else None
+        )
+        result_tuple = cpp_module.run_mcts_cpp(
+            root_state,
+            network_interface,
+            config,
+            handle_to_pass,  # Pass handle (can be None)
+            last_action,
+        )
+    except Exception as cpp_err:
+        logger.error(f"Error during C++ MCTS execution: {cpp_err}", exc_info=True)
+        return {}, None  # Return empty on C++ error
 
-    # Validate return type
-    if not isinstance(visit_counts, dict):
-        logger.error(f"C++ MCTS returned unexpected type: {type(visit_counts)}")
-        return {}
+    # Validate and unpack the returned tuple
+    if not isinstance(result_tuple, tuple) or len(result_tuple) != 2:
+        logger.error(
+            f"C++ MCTS returned unexpected type or length: {type(result_tuple)}"
+        )
+        return {}, None
 
-    # Filter and validate keys/values
-    result: dict[int, int] = {}
-    for k, v in visit_counts.items():
-        if isinstance(k, int) and isinstance(v, int):
-            result[k] = v
-        else:
-            logger.warning(
-                f"Skipping invalid result entry: ({k!r}:{type(k)}, {v!r}:{type(v)})"
-            )
-    return result
+    visit_counts_raw, new_tree_handle = result_tuple
+
+    # Validate visit counts
+    validated_visit_counts: dict[int, int] = {}  # Use a different name here
+    if not isinstance(visit_counts_raw, dict):
+        logger.error(
+            f"C++ MCTS returned unexpected type for visit counts: {type(visit_counts_raw)}"
+        )
+        # validated_visit_counts remains empty
+    else:
+        # Filter and validate keys/values
+        for k, v in visit_counts_raw.items():
+            if isinstance(k, int) and isinstance(v, int):
+                validated_visit_counts[k] = v  # Populate the new dict
+            else:
+                logger.warning(
+                    f"Skipping invalid result entry: ({k!r}:{type(k)}, {v!r}:{type(v)})"
+                )
+
+    # The handle can be None if C++ returns a null capsule (e.g., on error or terminal state)
+    # Check if the returned handle is None (Python None, not a null capsule object)
+    if new_tree_handle is None:
+        logger.debug("C++ MCTS returned None for the tree handle.")
+        return validated_visit_counts, None
+
+    # If it's not None, assume it's a valid capsule handle
+    return validated_visit_counts, new_tree_handle
