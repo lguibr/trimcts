@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <pybind11/pybind11.h> // Include pybind11 first
@@ -51,8 +50,8 @@ namespace trimcts
     float calculate_puct(const SearchConfig &config) const;
   };
 
-  // Main MCTS function signature
-  VisitMap run_mcts_cpp_internal(
+  // Main MCTS function signature with visibility macro
+  PYBIND11_EXPORT VisitMap run_mcts_cpp_internal( // Added PYBIND11_EXPORT
       py::object root_state,
       py::object network_interface, // AlphaZero interface for now
       const SearchConfig &config);

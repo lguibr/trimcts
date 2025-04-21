@@ -43,18 +43,12 @@ class SearchConfiguration(BaseModel):
         le=1.0,
     )
 
-    # Temperature (for action selection after search)
-    # Note: Temperature for selection *during* search is often implicitly 1.0
-    # This might be applied *after* getting visit counts from C++.
-    # We won't pass this to C++ for now, apply it in Python if needed.
-    # selection_temperature: float = Field(default=1.0, ge=0)
-
-    # Batching (Handled by C++ internally for now)
-    # virtual_loss: float = Field(default=1.0) # Common technique, add later if needed
-    # num_parallel_traversals: int = Field(default=8) # Add later if needed
-
-    # MuZero Specific (Add later)
-    # value_delta_max: float = Field(default=0.01) # MuZero specific
+    # Batching for Network Evaluations
+    mcts_batch_size: int = Field(
+        default=8,  # Default to 8 for potential performance gain
+        description="Number of leaf nodes to collect before calling network evaluate_batch.",
+        gt=0,
+    )
 
     # Use ConfigDict for Pydantic V2
     model_config = ConfigDict(validate_assignment=True)
