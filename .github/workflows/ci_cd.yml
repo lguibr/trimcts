@@ -38,14 +38,15 @@ jobs:
           pip install numpy pydantic typing-extensions pytest
           mypy src tests
 
-  build_wheels:
+  build_platform_wheels: # Renamed for clarity
     name: Build Wheel (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     needs: lint_and_type_check
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Only build macOS and Windows here
+        os: [macos-latest, windows-latest]
         python-version: ['3.10', '3.11', '3.12']
 
     steps:
@@ -65,18 +66,57 @@ jobs:
           pip install pybind11>=2.10 cmake
 
       - name: Build wheel
-        run: pip wheel . --wheel-dir dist/ --no-deps
+        run: pip wheel . --wheel-dir wheelhouse/ --no-deps
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
+          # Consistent naming pattern prefix
           name: python-wheels-${{ matrix.os }}-${{ matrix.python-version }}
-          path: dist/*.whl
+          path: wheelhouse/*.whl
+
+  build_linux_wheels:
+    name: Build Linux Wheels (manylinux)
+    runs-on: ubuntu-latest
+    needs: lint_and_type_check
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU # Needed for building non-native architectures if enabled
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - name: Build wheels with cibuildwheel
+        uses: pypa/cibuildwheel@v2.19.2 # Use a specific version
+        env:
+          # Configure cibuildwheel
+          # Build CPython 3.10, 3.11, 3.12 for x86_64
+          CIBW_BUILD: "cp310-* cp311-* cp312-*"
+          CIBW_ARCHS_LINUX: x86_64 # Specify architectures (auto usually works)
+          # Add other architectures like aarch64 if desired: CIBW_ARCHS_LINUX: "x86_64 aarch64"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014 # Use a common manylinux image
+          # CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014 # If building aarch64
+          CIBW_BUILD_VERBOSITY: 1 # Increase verbosity
+          # Pass build requirements needed inside the container
+          CIBW_BEFORE_BUILD_LINUX: "pip install cmake pybind11>=2.10"
+
+      - name: Upload Linux wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Consistent naming pattern prefix
+          name: python-wheels-linux # Single artifact for all Linux wheels
+          path: ./wheelhouse/*.whl # cibuildwheel outputs to wheelhouse/
 
   test:
     name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    needs: build_wheels
+    # Depend on both platform and linux wheel builds
+    needs: [build_platform_wheels, build_linux_wheels]
     strategy:
       fail-fast: false
       matrix:
@@ -94,15 +134,29 @@ jobs:
           cache: 'pip'
           cache-dependency-path: 'pyproject.toml'
 
-      - name: Download wheel artifact
+      - name: Download wheel artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wheels-linux # Download the combined Linux artifact
+          path: dist
+
+      - name: Download wheel artifact (macOS/Windows)
+        if: matrix.os != 'ubuntu-latest'
         uses: actions/download-artifact@v4
         with:
           name: python-wheels-${{ matrix.os }}-${{ matrix.python-version }}
           path: dist
 
+      - name: List downloaded files (for debugging)
+        run: ls -R dist
+
       - name: Install package from wheel and test dependencies
         run: |
-          pip install dist/*.whl
+          # Install the specific wheel downloaded for this platform/python combo
+          # Use pip's ability to find the right wheel in the directory
+          pip install --find-links dist/ trimcts
+          # Install dev dependencies
           pip install .[dev]
 
       - name: Run tests with coverage
@@ -121,16 +175,16 @@ jobs:
     if: github.repository == 'lguibr/trimcts' && (github.event_name == 'push' || github.event_name == 'pull_request')
 
     steps:
-      - name: Checkout code # Checkout needed for path mapping by Codecov
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetch all history for accurate commit info
+          fetch-depth: 0
 
       - name: Download all coverage artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: coverage-* # Download only coverage artifacts
+          pattern: coverage-*
           merge-multiple: true
 
       - name: List downloaded artifacts (for debugging)
@@ -139,7 +193,7 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
-          token: ${{ secrets.CODECOV_TOKEN }} 
+          token: ${{ secrets.CODECOV_TOKEN }}
           directory: artifacts/
           fail_ci_if_error: true
           verbose: true
@@ -147,38 +201,26 @@ jobs:
   publish_to_pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
-    needs: test
+    # Depend on both platform and linux wheel builds completing
+    needs: [build_platform_wheels, build_linux_wheels, test]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'lguibr/trimcts'
     permissions:
-      id-token: write # This MUST be present and correctly indented
+      id-token: write
 
     steps:
-      # Checkout code needed to build sdist (if you add sdist build later)
-      # - name: Checkout code
-      #   uses: actions/checkout@v4
-      #   with:
-      #     submodules: recursive
-
-      # - name: Setup Python
-      #   uses: actions/setup-python@v5
-      #   with:
-      #     python-version: '3.12'
-
-      # - name: Install build tool
-      #   run: python -m pip install --upgrade build
-
-      # - name: Build sdist
-      #   run: python -m build --sdist
+      # No checkout needed if only publishing pre-built artifacts
 
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: dist # Download all artifacts into dist/
+          # Use pattern matching to get all wheel artifacts
           pattern: python-wheels-*
-          merge-multiple: true
+          merge-multiple: true # Combine artifacts from different jobs into one directory
 
       - name: List distributions (for debugging)
         run: ls -R dist
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        # OIDC will be used automatically
