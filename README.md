@@ -1,5 +1,5 @@
 
-[![CI](https://github.com/lguibr/trimcts/actions/workflows/ci.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
+[![CI](https://github.com/lguibr/trimcts/actions/workflows/ci_cd.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
 [![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
 [![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- TODO: Add Codecov token -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -184,7 +184,7 @@ else:
 
 ```
 trimcts/
-├── .github/workflows/      # CI configuration (e.g., ci.yml)
+├── .github/workflows/      # CI configuration (e.g., ci_cd.yml)
 ├── src/trimcts/            # Python package source ([src/trimcts/README.md](src/trimcts/README.md))
 │   ├── cpp/                # C++ source code ([src/trimcts/cpp/README.md](src/trimcts/cpp/README.md))
 │   │   ├── CMakeLists.txt  # CMake build script for C++ part
