@@ -165,7 +165,5 @@ jobs:
       - name: List downloaded wheels (for debugging)
         run: ls -R dist
 
-      - name: Publish package distributions to PyPI
+      - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          token: ${{ secrets.PYPI_API_TOKEN }}
