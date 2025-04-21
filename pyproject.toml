@@ -1,0 +1,44 @@
+# File: pyproject.toml
+
+[build-system]
+requires = [
+  "setuptools>=61.0",
+  "wheel",
+  "pybind11>=2.10",
+  "cmake>=3.14"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trimcts"
+version = "0.1.0"
+authors = [
+  { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
+]
+description = "High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games"
+readme = "README.md"
+license = { file="LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 3 – Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: C++",
+]
+dependencies = [
+  "numpy>=1.20.0",
+  "pydantic>=2.0.0",
+  "trianglengin>=1.0.6",
+]
+
+[project.urls]
+"Homepage"    = "https://github.com/lguibr/trimcts"
+"Bug Tracker" = "https://github.com/lguibr/trimcts/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0","pytest-cov","ruff","mypy"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --cov=src/trimcts --cov-report=term-missing"
+testpaths = ["tests"]

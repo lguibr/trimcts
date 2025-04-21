@@ -1,0 +1,17 @@
+# File: MANIFEST.in
+# Include C++ source files and CMakeLists.txt
+graft src/trimcts/cpp
+
+# Include Python source files
+graft src/trimcts
+graft tests
+
+# Include project metadata
+include README.md
+include LICENSE # Ensure LICENSE is included
+include pyproject.toml
+
+# Exclude build artifacts and caches
+global-exclude *.py[cod] __pycache__ *.so *.pyd *.dylib *.egg-info CMakeCache.txt CMakeFiles
+prune build
+prune dist

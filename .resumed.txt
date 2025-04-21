@@ -1,0 +1,2242 @@
+File: LICENSE
+
+MIT License
+
+Copyright (c) 2024 Luis Guilherme P. M.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+File: pyproject.toml
+# File: pyproject.toml
+
+[build-system]
+requires = [
+  "setuptools>=61.0",
+  "wheel",
+  "pybind11>=2.10",
+  "cmake>=3.14"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trimcts"
+version = "0.1.0"
+authors = [
+  { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
+]
+description = "High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games"
+readme = "README.md"
+license = { file="LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 3 – Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: C++",
+]
+dependencies = [
+  "numpy>=1.20.0",
+  "pydantic>=2.0.0",
+  "trianglengin>=1.0.6",
+]
+
+[project.urls]
+"Homepage"    = "https://github.com/lguibr/trimcts"
+"Bug Tracker" = "https://github.com/lguibr/trimcts/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0","pytest-cov","ruff","mypy"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --cov=src/trimcts --cov-report=term-missing"
+testpaths = ["tests"]
+
+
+File: MANIFEST.in
+# File: MANIFEST.in
+# Include C++ source files and CMakeLists.txt
+graft src/trimcts/cpp
+
+# Include Python source files
+graft src/trimcts
+graft tests
+
+# Include project metadata
+include README.md
+include LICENSE # Ensure LICENSE is included
+include pyproject.toml
+
+# Exclude build artifacts and caches
+global-exclude *.py[cod] __pycache__ *.so *.pyd *.dylib *.egg-info CMakeCache.txt CMakeFiles
+prune build
+prune dist
+
+File: README.md
+
+# TriMCTS
+
+[![CI](https://github.com/lguibr/trimcts/actions/workflows/ci.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
+[![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
+[![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- TODO: Add Codecov token -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+**TriMCTS** is an installable Python package providing C++ bindings for Monte Carlo Tree Search, supporting both AlphaZero and MuZero paradigms, optimized for triangular grid games like the one in `trianglengin`.
+
+## 🔑 Key Features
+
+-   High-performance C++ core implementation.
+-   Seamless Python integration via Pybind11.
+-   Supports AlphaZero-style evaluation (policy/value from state).
+-   (Planned) Supports MuZero-style evaluation (initial inference + recurrent inference).
+-   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise).
+-   Designed for use with external Python game state objects and network evaluators.
+
+## 🚀 Installation
+
+```bash
+# From PyPI (once published)
+pip install trimcts
+
+# For development (from cloned repo root)
+# Ensure you clean previous builds if you encounter issues:
+# rm -rf build/ src/trimcts.egg-info/ dist/
+pip install -e .[dev]
+```
+
+## 💡 Usage Example (AlphaZero Style)
+
+```python
+import time
+import numpy as np
+import torch # Added import
+from trianglengin.core.environment import GameState # Example state object
+from trianglengin.config import EnvConfig
+# Assuming alphatriangle is installed and provides these:
+# from alphatriangle.nn import NeuralNetwork # Example network wrapper
+# from alphatriangle.config import ModelConfig, TrainConfig
+
+from trimcts import run_mcts, SearchConfiguration, AlphaZeroNetworkInterface
+
+# --- Mock Neural Network for demonstration ---
+# Replace with your actual network implementation
+class MockNeuralNetwork:
+    def __init__(self, *args, **kwargs):
+        self.model = torch.nn.Module() # Dummy model
+        print("MockNeuralNetwork initialized.")
+
+    def evaluate(self, state: GameState) -> tuple[dict[int, float], float]:
+        # Mock evaluation: uniform policy over valid actions, fixed value
+        valid_actions = state.valid_actions()
+        if not valid_actions:
+            return {}, 0.0 # Terminal or no valid actions
+        policy = {action: 1.0 / len(valid_actions) for action in valid_actions}
+        value = 0.5 # Fixed mock value
+        return policy, value
+
+    def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
+        return [self.evaluate(s) for s in states]
+
+    def load_weights(self, path):
+        print(f"Mock: Pretending to load weights from {path}")
+
+    def to(self, device):
+        print(f"Mock: Pretending to move model to {device}")
+        return self
+# --- End Mock Neural Network ---
+
+
+# 1. Define your AlphaZero network wrapper conforming to the interface
+class MyAlphaZeroWrapper(AlphaZeroNetworkInterface):
+    def __init__(self, model_path: str | None = None):
+        # Load your PyTorch/TensorFlow/etc. model here
+        # Example using a Mock NeuralNetwork
+        env_cfg = EnvConfig()
+        # model_cfg = ModelConfig() # Assuming these exist if using alphatriangle
+        # train_cfg = TrainConfig(DEVICE="cpu")
+        self.network = MockNeuralNetwork() # Using Mock for this example
+        # Load weights if model_path is provided
+        if model_path:
+             self.network.load_weights(model_path)
+        # self.network.to(torch.device("cpu")) # Ensure model is on correct device if using real NN
+        self.network.model.eval() # Set to evaluation mode
+        print("MyAlphaZeroWrapper initialized.")
+
+    def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
+        """
+        Evaluates a single game state.
+
+        Args:
+            state: The GameState object (passed from C++).
+
+        Returns:
+            A tuple containing:
+                - Policy dict: {action_index: probability}
+                - Value estimate: float
+        """
+        print(f"Python: Evaluating state step {state.current_step}")
+        # Use the evaluate method of your network wrapper
+        # Add necessary state transformations if your network expects specific input format
+        # e.g., state_tensor = self.transform_state(state)
+        # policy_logits, value_logit = self.network.model(state_tensor)
+        # policy_map = self.process_policy(policy_logits, state.valid_actions())
+        # value = torch.tanh(value_logit).item() # Example processing
+        policy_map, value = self.network.evaluate(state) # Using mock evaluate directly
+        print(f"Python: Evaluation result - Policy keys: {len(policy_map)}, Value: {value:.4f}")
+        return policy_map, value
+
+    def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
+        """
+        Evaluates a batch of game states.
+
+        Args:
+            states: A list of GameState objects.
+
+        Returns:
+            A list of tuples, each containing (policy_dict, value_estimate).
+        """
+        print(f"Python: Evaluating batch of {len(states)} states.")
+        # Use the evaluate_batch method of your network wrapper
+        # Add necessary state transformations and batching if needed
+        # e.g., batch_tensor = self.transform_batch(states)
+        # policy_logits_batch, value_logit_batch = self.network.model(batch_tensor)
+        # results = self.process_batch_output(policy_logits_batch, value_logit_batch, states)
+        results = self.network.evaluate_batch(states) # Using mock evaluate_batch directly
+        print(f"Python: Batch evaluation returned {len(results)} results.")
+        return results
+
+# 2. Instantiate your game state and network wrapper
+env_config = EnvConfig()
+# Ensure the config creates a playable state for the example
+env_config.ROWS = 3
+env_config.COLS = 3
+env_config.NUM_SHAPE_SLOTS = 1
+env_config.PLAYABLE_RANGE_PER_ROW = [(0,3), (0,3), (0,3)] # Example playable range
+
+root_state = GameState(config=env_config, initial_seed=42)
+network_wrapper = MyAlphaZeroWrapper() # Add path to your trained model if needed
+
+# 3. Configure MCTS parameters
+mcts_config = SearchConfiguration()
+mcts_config.max_simulations = 50
+mcts_config.max_depth = 10
+mcts_config.cpuct = 1.25
+mcts_config.dirichlet_alpha = 0.3
+mcts_config.dirichlet_epsilon = 0.25
+mcts_config.discount = 1.0 # AlphaZero typically uses no discount during search
+
+# 4. Run MCTS
+# The C++ run_mcts function will call network_wrapper.evaluate_batch() or evaluate_state()
+print("Running MCTS...")
+# Ensure root_state is not terminal before running
+if not root_state.is_over():
+    # run_mcts returns a dictionary: {action: visit_count}
+    start_time = time.time()
+    visit_counts = run_mcts(root_state, network_wrapper, mcts_config)
+    end_time = time.time()
+    print(f"\nMCTS Result (Visit Counts) after {end_time - start_time:.2f} seconds:")
+    print(visit_counts)
+
+    # Example: Select best action based on visits
+    if visit_counts:
+        best_action = max(visit_counts, key=visit_counts.get)
+        print(f"\nBest action based on visits: {best_action}")
+    else:
+        print("\nNo actions explored or MCTS failed.")
+else:
+    print("Root state is already terminal. Cannot run MCTS.")
+
+```
+
+*(MuZero example will be added later)*
+
+## 📂 Project Structure
+
+```
+trimcts/
+├── .github/workflows/      # CI configuration (link to workflow file)
+├── src/trimcts/            # Python package source (link to src/trimcts/README.md if exists)
+│   ├── cpp/                # C++ source code (link to src/trimcts/cpp/README.md if exists)
+│   │   ├── CMakeLists.txt  # CMake build script for C++ part
+│   │   ├── bindings.cpp    # Pybind11 bindings
+│   │   ├── config.h        # C++ configuration struct
+│   │   ├── mcts.cpp        # C++ MCTS implementation
+│   │   ├── mcts.h          # C++ MCTS header
+│   │   └── python_interface.h # C++ helpers for Python interaction
+│   ├── __init__.py         # Exposes public API (run_mcts, configs, etc.)
+│   ├── config.py           # Python SearchConfiguration (Pydantic)
+│   └── mcts_wrapper.py     # Python network interface definition
+├── tests/                  # Python tests (link to tests/README.md if exists)
+│   ├── conftest.py
+│   └── test_alpha_wrapper.py # Tests for AlphaZero functionality
+├── .gitignore
+├── LICENSE
+├── MANIFEST.in             # Specifies files for source distribution
+├── pyproject.toml          # Build system & package configuration
+├── README.md               # This file
+└── setup.py                # Setup script for C++ extension building
+```
+
+## 🛠️ Building from Source
+
+1.  Clone the repository: `git clone https://github.com/lguibr/trimcts.git`
+2.  Navigate to the directory: `cd trimcts`
+3.  **Recommended:** Create and activate a virtual environment:
+    ```bash
+    python -m venv .venv
+    source .venv/bin/activate # On Windows use `.venv\Scripts\activate`
+    ```
+4.  Install build dependencies: `pip install pybind11>=2.10 cmake wheel`
+5.  **Clean previous builds (important if switching Python versions or encountering issues):**
+    ```bash
+    rm -rf build/ src/trimcts.egg-info/ dist/ src/trimcts/trimcts_cpp.*.so
+    ```
+6.  Install the package in editable mode: `pip install -e .`
+
+## 🧪 Running Tests
+
+```bash
+# Make sure you have installed dev dependencies
+pip install -e .[dev]
+pytest
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! Please follow standard fork-and-pull-request workflow. Ensure tests pass and code adheres to formatting/linting standards (Ruff).
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+File: setup.py
+# File: setup.py
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import sysconfig
+from pathlib import Path
+
+from setuptools import Extension, find_packages, setup
+from setuptools.command.build_ext import build_ext
+from setuptools.command.develop import develop as _develop
+
+
+# Convert distutils Windows platform specifiers to CMake -A arguments
+PLAT_TO_CMAKE = {
+    "win32": "Win32",
+    "win-amd64": "x64",
+    "win-arm32": "ARM",
+    "win-arm64": "ARM64",
+}
+
+
+# A CMakeExtension needs a sourcedir instead of a file list.
+# The name will be used as the extension name, and required to match
+# the CMake target name.
+class CMakeExtension(Extension):
+    def __init__(self, name: str, sourcedir: str = "") -> None:
+        super().__init__(name, sources=[])
+        self.sourcedir = os.fspath(Path(sourcedir).resolve())
+
+
+class CMakeBuild(build_ext):
+    def build_extension(self, ext: CMakeExtension) -> None:
+        ext_fullpath = Path(self.get_ext_fullpath(ext.name)).resolve()
+        extdir = ext_fullpath.parent.resolve()  # Ensure extdir is absolute
+
+        cmake_generator = os.environ.get("CMAKE_GENERATOR", "")
+        cfg = "Debug" if self.debug else "Release"
+
+        # Set Python_EXECUTABLE, Python_INCLUDE_DIR explicitly.
+        python_executable = sys.executable
+        python_include_dir = sysconfig.get_path("include")
+
+        # Try to find the Python library file robustly
+        python_library_file = None
+        libdir = sysconfig.get_config_var("LIBDIR")
+        library = sysconfig.get_config_var("LIBRARY")
+        if libdir and library:
+            candidate = Path(libdir) / library
+            if candidate.exists():
+                python_library_file = str(candidate.resolve())
+            else:
+                # Sometimes LIBRARY might include the lib prefix/suffix, sometimes not
+                # Try finding based on common patterns if the direct path fails
+                potential_lib_names = [
+                    f"libpython{sysconfig.get_python_version()}.a",
+                    f"libpython{sysconfig.get_python_version()}.dylib",
+                    f"python{sys.version_info.major}{sys.version_info.minor}.lib",  # Windows
+                ]
+                for name in potential_lib_names:
+                    candidate = Path(libdir) / name
+                    if candidate.exists():
+                        python_library_file = str(candidate.resolve())
+                        break
+
+        # If still not found, try sysconfig.get_config_var('LIBPL') as last resort directory
+        if not python_library_file:
+            libpl = sysconfig.get_config_var("LIBPL")
+            if libpl and Path(libpl).is_dir():
+                # Check common library names within LIBPL
+                for name in potential_lib_names:
+                    candidate = Path(libpl) / name
+                    if candidate.exists():
+                        python_library_file = str(candidate.resolve())
+                        break
+
+        cmake_args = [
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
+            f"-DPython_EXECUTABLE={python_executable}",
+            f"-DPython_INCLUDE_DIR={python_include_dir}",
+            # Only pass Python_LIBRARIES if we found the specific file
+            f"-DPython_LIBRARIES={python_library_file}" if python_library_file else "",
+            f"-DCMAKE_BUILD_TYPE={cfg}",
+            "-Dpybind11_FINDPYTHON=ON",
+            "-DPython_FIND_STRATEGY=LOCATION",  # Prioritize using the executable location
+        ]
+        # Filter out empty strings from cmake_args (like potentially empty Python_LIBRARIES)
+        cmake_args = [arg for arg in cmake_args if arg]
+
+        # --- Rest of the CMake configuration and build steps remain the same ---
+
+        # CMake generator and platform handling
+        if sys.platform.startswith("darwin"):
+            archs = re.findall(r"-arch (\S+)", os.environ.get("ARCHFLAGS", ""))
+            if archs:
+                cmake_args += ["-DCMAKE_OSX_ARCHITECTURES={}".format(";".join(archs))]
+
+        if "CMAKE_ARGS" in os.environ:
+            cmake_args += [item for item in os.environ["CMAKE_ARGS"].split(" ") if item]
+
+        cmake_args += [f"-DTRIMCTS_VERSION_INFO={self.distribution.get_version()}"]
+
+        build_args = ["--config", cfg]
+
+        if self.compiler.compiler_type == "msvc":
+            single_config = any(x in cmake_generator for x in {"NMake", "Ninja"})
+            contains_arch = any(x in cmake_generator for x in {"ARM", "Win64"})
+            if not single_config and not contains_arch:
+                cmake_args += ["-A", PLAT_TO_CMAKE[self.plat_name]]
+            if not single_config:
+                build_args += ["--", "/m"]
+
+        if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
+            if hasattr(self, "parallel") and self.parallel:
+                build_args += [f"-j{self.parallel}"]
+
+        # --- Build Execution ---
+        build_temp = Path(self.build_temp) / ext.name
+        build_temp.mkdir(parents=True, exist_ok=True)  # Ensure build temp exists
+
+        print("-" * 10, "Running CMake prepare", "-" * 40)
+        print(
+            f"CMake command: cmake {ext.sourcedir} {' '.join(cmake_args)}"
+        )  # Debug print
+        subprocess.run(
+            ["cmake", ext.sourcedir, *cmake_args],
+            cwd=build_temp,
+            check=True,
+        )
+
+        print("-" * 10, "Building extension", "-" * 43)
+        subprocess.run(
+            ["cmake", "--build", ".", *build_args],
+            cwd=build_temp,
+            check=True,
+        )
+        print("-" * 10, "Finished building extension", "-" * 36)
+
+        # --- Copying (Fallback) ---
+        # Check if the file was created in the expected location by CMake
+        if not ext_fullpath.exists():
+            module_name = ext.name.split(".")[-1]
+            found = False
+            # Search within the build temp directory
+            for suffix in (".so", ".dylib", ".pyd"):
+                candidates = list(build_temp.rglob(f"{module_name}*{suffix}"))
+                if candidates:
+                    built = candidates[0]
+                    print(
+                        f"Copying built extension from build temp: {built} -> {ext_fullpath}"
+                    )
+                    ext_fullpath.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(built, ext_fullpath)
+                    found = True
+                    break
+            if not found:
+                raise RuntimeError(
+                    f"Could not find built extension {module_name}.* in {extdir} or {build_temp}"
+                )
+        else:
+            print(f"Found built extension at target: {ext_fullpath}")
+
+
+class Develop(_develop):
+    """Run CMake build_ext as part of 'python setup.py develop'."""
+
+    def run(self):
+        self.run_command("build_ext")
+        super().run()
+
+
+setup(
+    # Metadata defined in pyproject.toml is preferred
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
+    ext_modules=[CMakeExtension("trimcts.trimcts_cpp", sourcedir="src/trimcts/cpp")],
+    cmdclass={
+        "build_ext": CMakeBuild,
+        "develop": Develop,
+    },
+    zip_safe=False,
+)
+
+
+File: .python-version
+3.10.13
+
+
+File: .pytest_cache/CACHEDIR.TAG
+Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by pytest.
+# For information about cache directory tags, see:
+#	https://bford.info/cachedir/spec.html
+
+
+File: .pytest_cache/README.md
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+
+File: .ruff_cache/CACHEDIR.TAG
+Signature: 8a477f597d28d172789f06886806bc55
+
+File: tests/test_alpha_wrapper.py
+# File: tests/test_alpha_wrapper.py
+import time
+from typing import Any, TypeAlias  # Import TypeAlias
+
+import pytest
+
+# --- Define GameState and EnvConfig types ---
+# Try importing the real ones first
+try:
+    from trianglengin.config import EnvConfig as RealEnvConfig
+    from trianglengin.core.environment import GameState as RealGameState
+
+    HAS_TRIANGLENGIN = True
+    # Define type aliases pointing to the real classes
+    GameState: TypeAlias = RealGameState
+    EnvConfig: TypeAlias = RealEnvConfig
+except ImportError:
+    HAS_TRIANGLENGIN = False
+
+    # Define minimal mock classes if trianglengin is not available
+    class MockGameStateForTest:
+        def __init__(self, *_args: Any, **_kwargs: Any):  # Prefix unused args
+            self.step_count = 0
+            self._is_over = False  # Add state for forcing terminal
+            self.current_step = 0  # Add current_step for logging in wrapper
+
+        def copy(self) -> "MockGameStateForTest":
+            s = MockGameStateForTest()
+            s.step_count = self.step_count
+            s._is_over = self._is_over
+            s.current_step = self.current_step
+            return s
+
+        # Prefix unused action
+        def step(self, _action: int) -> tuple[float, bool]:
+            if self._is_over:
+                return 0.0, True  # No change if already over
+            self.step_count += 1
+            self.current_step += 1
+            self._is_over = self.step_count >= 5  # Example terminal condition
+            return 0.0, self._is_over
+
+        def is_over(self) -> bool:
+            return self._is_over or self.step_count >= 5
+
+        def get_outcome(self) -> float:
+            return -1.0 if self.is_over() else 0.0  # Use -1 for loss
+
+        def valid_actions(self) -> list[int]:
+            return [] if self.is_over() else [0, 1]
+
+        def force_game_over(self, reason: str):  # Add method for testing
+            print(f"Mock force_game_over: {reason}")
+            self._is_over = True
+
+    class MockEnvConfigForTest:
+        pass
+
+    # Define type aliases pointing to the mock classes
+    GameState: TypeAlias = MockGameStateForTest  # type: ignore # Allow redefinition for mock case
+    EnvConfig: TypeAlias = MockEnvConfigForTest  # type: ignore # Allow redefinition for mock case
+# --- End GameState/EnvConfig Definition ---
+
+
+# Now import trimcts components AFTER GameState/EnvConfig are defined
+from trimcts import AlphaZeroNetworkInterface, SearchConfiguration, run_mcts
+
+
+# --- Dummy Network Implementation ---
+# This class now uses the GameState type alias defined above
+class DummyAlphaNetwork(AlphaZeroNetworkInterface):
+    """A simple network that returns fixed policy/value."""
+
+    def __init__(self, action_dim: int = 2, value: float = 0.5, delay: float = 0.0):
+        self.action_dim = action_dim
+        self.value = value
+        self.policy = dict.fromkeys(range(action_dim), 1.0 / action_dim)
+        self.eval_count = 0
+        self.batch_eval_count = 0
+        self.delay = delay  # Simulate network inference time
+
+    def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
+        self.eval_count += 1
+        if self.delay > 0:
+            time.sleep(self.delay)
+        # Return policy only for valid actions in the current state
+        valid_actions = state.valid_actions()
+        valid_policy = {a: p for a, p in self.policy.items() if a in valid_actions}
+        policy_sum = sum(valid_policy.values())
+        if policy_sum > 1e-6:
+            normalized_policy = {a: p / policy_sum for a, p in valid_policy.items()}
+        else:  # Handle case where no valid actions have policy prob
+            normalized_policy = {}
+            if (
+                valid_actions
+            ):  # Assign uniform if valid actions exist but policy was zero
+                uniform_prob = 1.0 / len(valid_actions)
+                normalized_policy = dict.fromkeys(valid_actions, uniform_prob)
+
+        return normalized_policy, self.value
+
+    def evaluate_batch(
+        self, states: list[GameState]
+    ) -> list[tuple[dict[int, float], float]]:
+        self.batch_eval_count += 1
+        if self.delay > 0:
+            time.sleep(self.delay * 0.1 * len(states))  # Simulate some batch overhead
+        return [self.evaluate_state(s) for s in states]
+
+
+# --- Test Fixtures ---
+@pytest.fixture
+def dummy_state() -> GameState:
+    """Provides a simple dummy game state."""
+    if HAS_TRIANGLENGIN:
+        # Use the real classes if available
+        # Define a playable range consistent with ROWS=3, COLS=3
+        test_playable_range = [(0, 3), (0, 3), (0, 3)]
+        test_config = RealEnvConfig(
+            ROWS=3,
+            COLS=3,
+            NUM_SHAPE_SLOTS=1,
+            PLAYABLE_RANGE_PER_ROW=test_playable_range,  # Provide the range
+        )
+        return RealGameState(config=test_config, initial_seed=1)
+    else:
+        # Use the mock classes (via the GameState alias)
+        return GameState()
+
+
+@pytest.fixture
+def dummy_network() -> DummyAlphaNetwork:
+    """Provides a dummy network interface."""
+    # Determine action dim based on whether real or mock is used
+    # For now, let's stick to action_dim=2 for the dummy network as defined.
+    return DummyAlphaNetwork(action_dim=2, value=0.1)
+
+
+@pytest.fixture
+def search_config() -> SearchConfiguration:
+    """Provides a default search configuration."""
+    return SearchConfiguration(
+        max_simulations=16,  # Keep low for testing
+        max_depth=5,
+        cpuct=1.25,
+        dirichlet_alpha=0.3,
+        dirichlet_epsilon=0.25,
+        discount=1.0,
+    )
+
+
+# --- Tests ---
+
+
+def test_mcts_run_alpha_basic(
+    dummy_state: GameState,
+    dummy_network: DummyAlphaNetwork,
+    search_config: SearchConfiguration,
+):
+    """Test basic MCTS run with AlphaZero interface."""
+    search_config.max_simulations = 10
+    search_config.dirichlet_alpha = (
+        0.0  # Disable noise for predictable results initially
+    )
+
+    if dummy_state.is_over():
+        pytest.skip("Initial dummy state is already terminal.")
+
+    print("\n--- Starting Basic MCTS Run ---")
+    start_time = time.time()
+    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
+    duration = time.time() - start_time
+    print(f"--- MCTS Run Finished ({duration:.4f}s) ---")
+    print(f"Visit Counts: {visit_counts}")
+    print(f"Network single evals: {dummy_network.eval_count}")
+    print(f"Network batch evals: {dummy_network.batch_eval_count}")
+
+    assert isinstance(visit_counts, dict)
+    # Check if actions explored are valid for the root state
+    valid_root_actions = set(dummy_state.valid_actions())
+    assert set(visit_counts.keys()).issubset(valid_root_actions)
+    assert all(isinstance(v, int) and v >= 0 for v in visit_counts.values())
+    # With 10 sims, we expect some visits
+    assert sum(visit_counts.values()) > 0
+    # Since policy is uniform and value is constant, visits might be somewhat balanced
+    # This is a weak check
+    if len(valid_root_actions) > 0:
+        assert len(visit_counts) > 0
+
+
+def test_mcts_run_alpha_with_noise(
+    dummy_state: GameState,
+    dummy_network: DummyAlphaNetwork,
+    search_config: SearchConfiguration,
+):
+    """Test MCTS run with Dirichlet noise enabled."""
+    search_config.max_simulations = 32  # More sims to see noise effect
+    search_config.dirichlet_alpha = 0.5
+    search_config.dirichlet_epsilon = 0.25
+
+    if dummy_state.is_over():
+        pytest.skip("Initial dummy state is already terminal.")
+
+    print("\n--- Starting MCTS Run with Noise ---")
+    start_time = time.time()
+    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
+    duration = time.time() - start_time
+    print(f"--- MCTS Run Finished ({duration:.4f}s) ---")
+    print(f"Visit Counts: {visit_counts}")
+
+    assert isinstance(visit_counts, dict)
+    valid_root_actions = set(dummy_state.valid_actions())
+    assert set(visit_counts.keys()).issubset(valid_root_actions)
+    assert all(isinstance(v, int) and v >= 0 for v in visit_counts.values())
+    assert sum(visit_counts.values()) > 0
+
+
+def test_mcts_run_on_terminal_state(
+    dummy_state: GameState,
+    dummy_network: DummyAlphaNetwork,
+    search_config: SearchConfiguration,
+):
+    """Test MCTS run starting from a terminal state (should return empty)."""
+    # Make the state terminal
+    if HAS_TRIANGLENGIN:
+        # Use the real GameState's method to force game over
+        dummy_state.force_game_over("Forced terminal for test")
+    else:
+        # Use the mock state's method
+        if hasattr(dummy_state, "force_game_over"):
+            dummy_state.force_game_over("Forced terminal for mock test")
+        else:
+            # Fallback if mock doesn't have force_game_over (it should now)
+            dummy_state.step_count = 10  # Assuming step_count >= 5 makes it terminal
+
+    assert dummy_state.is_over()
+
+    print("\n--- Starting MCTS Run on Terminal State ---")
+    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
+    print(f"Visit Counts: {visit_counts}")
+
+    assert isinstance(visit_counts, dict)
+    assert len(visit_counts) == 0  # MCTS should return empty for terminal root
+
+
+File: trimcts.egg-info/PKG-INFO
+Metadata-Version: 2.4
+Name: trimcts
+Version: 0.1.0
+Summary: High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games
+Author-email: "Luis Guilherme P. M." <lgpelin92@gmail.com>
+Project-URL: Homepage, https://github.com/lguibr/trimcts
+Project-URL: Bug Tracker, https://github.com/lguibr/trimcts/issues
+Classifier: Development Status :: 3 – Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: C++
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: trianglengin>=1.0.6
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+
+
+# TriMCTS
+
+[![CI](https://github.com/lguibr/trimcts/actions/workflows/ci.yml/badge.svg)](https://github.com/lguibr/trimcts/actions) <!-- CHANGE URL -->
+[![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
+[![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- CHANGE URL & TOKEN -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+**TriMCTS** is an installable Python package providing C++ bindings for Monte Carlo Tree Search, supporting both AlphaZero and MuZero paradigms, optimized for triangular grid games like the one in `trianglengin`.
+
+## 🔑 Key Features
+
+-   High-performance C++ core implementation.
+-   Seamless Python integration via Pybind11.
+-   Supports AlphaZero-style evaluation (policy/value from state).
+-   (Planned) Supports MuZero-style evaluation (initial inference + recurrent inference).
+-   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise).
+-   Designed for use with external Python game state objects and network evaluators.
+
+## 🚀 Installation
+
+```bash
+# From PyPI (once published)
+pip install trimcts
+
+# For development (from cloned repo root)
+pip install -e .[dev]
+```
+
+## 💡 Usage Example (AlphaZero Style)
+
+```python
+import numpy as np
+from trianglengin.core.environment import GameState # Example state object
+from trianglengin.config import EnvConfig
+from alphatriangle.nn import NeuralNetwork # Example network wrapper
+from alphatriangle.config import ModelConfig, TrainConfig
+
+from trimcts import run_mcts, SearchConfiguration, AlphaZeroNetworkInterface
+
+# 1. Define your AlphaZero network wrapper conforming to the interface
+class MyAlphaZeroWrapper(AlphaZeroNetworkInterface):
+    def __init__(self, model_path: str | None = None):
+        # Load your PyTorch/TensorFlow/etc. model here
+        # Example using alphatriangle's NeuralNetwork
+        env_cfg = EnvConfig()
+        model_cfg = ModelConfig()
+        train_cfg = TrainConfig(DEVICE="cpu") # Ensure CPU for this example if needed
+        self.network = NeuralNetwork(model_cfg, env_cfg, train_cfg, torch.device("cpu"))
+        # Load weights if model_path is provided
+        # self.network.load_weights(...)
+        self.network.model.eval()
+        print("MyAlphaZeroWrapper initialized.")
+
+    def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
+        """
+        Evaluates a single game state.
+
+        Args:
+            state: The GameState object (passed from C++).
+
+        Returns:
+            A tuple containing:
+                - Policy dict: {action_index: probability}
+                - Value estimate: float
+        """
+        print(f"Python: Evaluating state step {state.current_step}")
+        # Use the evaluate method of your network wrapper
+        policy_map, value = self.network.evaluate(state)
+        print(f"Python: Evaluation result - Policy keys: {len(policy_map)}, Value: {value:.4f}")
+        return policy_map, value
+
+    def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
+        """
+        Evaluates a batch of game states.
+
+        Args:
+            states: A list of GameState objects.
+
+        Returns:
+            A list of tuples, each containing (policy_dict, value_estimate).
+        """
+        print(f"Python: Evaluating batch of {len(states)} states.")
+        # Use the evaluate_batch method of your network wrapper
+        results = self.network.evaluate_batch(states)
+        print(f"Python: Batch evaluation returned {len(results)} results.")
+        return results
+
+# 2. Instantiate your game state and network wrapper
+env_config = EnvConfig()
+root_state = GameState(config=env_config, initial_seed=42)
+network_wrapper = MyAlphaZeroWrapper() # Add path to your trained model if needed
+
+# 3. Configure MCTS parameters
+mcts_config = SearchConfiguration()
+mcts_config.max_simulations = 50
+mcts_config.max_depth = 10
+mcts_config.cpuct = 1.5
+mcts_config.dirichlet_alpha = 0.3
+mcts_config.dirichlet_epsilon = 0.25
+mcts_config.discount = 1.0 # AlphaZero typically uses no discount during search
+
+# 4. Run MCTS
+# The C++ run_mcts function will call network_wrapper.evaluate_batch()
+print("Running MCTS...")
+# Ensure root_state is not terminal before running
+if not root_state.is_over():
+    # run_mcts returns a dictionary: {action: visit_count}
+    visit_counts = run_mcts(root_state, network_wrapper, mcts_config)
+    print("\nMCTS Result (Visit Counts):")
+    print(visit_counts)
+
+    # Example: Select best action based on visits
+    if visit_counts:
+        best_action = max(visit_counts, key=visit_counts.get)
+        print(f"\nBest action based on visits: {best_action}")
+    else:
+        print("\nNo actions explored or MCTS failed.")
+else:
+    print("Root state is already terminal. Cannot run MCTS.")
+
+```
+
+*(MuZero example will be added later)*
+
+## 📂 Project Structure
+
+```
+trimcts/
+├── .github/workflows/      # CI configuration
+├── src/trimcts/            # Python package source
+│   ├── cpp/                # C++ source code
+│   │   ├── CMakeLists.txt  # CMake build script for C++ part
+│   │   ├── bindings.cpp    # Pybind11 bindings
+│   │   ├── config.h        # C++ configuration struct
+│   │   ├── mcts.cpp        # C++ MCTS implementation
+│   │   ├── mcts.h          # C++ MCTS header
+│   │   └── python_interface.h # C++ helpers for Python interaction
+│   ├── __init__.py         # Exposes public API (run_mcts, configs, etc.)
+│   ├── config.py           # Python SearchConfiguration (Pydantic)
+│   └── mcts_wrapper.py     # Python network interface definition
+├── tests/                  # Python tests
+│   ├── conftest.py
+│   └── test_alpha_wrapper.py # Tests for AlphaZero functionality
+├── .gitignore
+├── LICENSE
+├── MANIFEST.in             # Specifies files for source distribution
+├── pyproject.toml          # Build system & package configuration
+├── README.md               # This file
+└── setup.py                # Setup script for C++ extension building
+```
+
+## 🛠️ Building from Source
+
+1.  Clone the repository: `git clone https://github.com/lguibr/trimcts.git`
+2.  Navigate to the directory: `cd trimcts`
+3.  Install build dependencies: `pip install pybind11>=2.10 cmake`
+4.  Install the package in editable mode: `pip install -e .`
+
+## 🧪 Running Tests
+
+```bash
+pip install -e .[dev]
+pytest
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! Please follow standard fork-and-pull-request workflow. Ensure tests pass and code adheres to formatting/linting standards (Ruff).
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+
+File: trimcts.egg-info/SOURCES.txt
+
+
+File: trimcts.egg-info/requires.txt
+numpy>=1.20.0
+pydantic>=2.0.0
+trianglengin>=1.0.6
+
+[dev]
+pytest>=7.0
+pytest-cov
+ruff
+mypy
+
+
+File: trimcts.egg-info/top_level.txt
+trimcts
+
+
+File: trimcts.egg-info/dependency_links.txt
+
+
+
+File: src/trimcts/config.py
+# File: src/trimcts/config.py
+"""
+Python configuration class for MCTS parameters.
+Uses Pydantic for validation.
+"""
+
+from pydantic import BaseModel, ConfigDict, Field  # Import ConfigDict
+
+
+class SearchConfiguration(BaseModel):
+    """MCTS Search Configuration."""
+
+    # Core Search Parameters
+    max_simulations: int = Field(
+        default=50, description="Maximum number of MCTS simulations per move.", gt=0
+    )
+    max_depth: int = Field(
+        default=10, description="Maximum depth for tree traversal.", gt=0
+    )
+
+    # UCT Parameters (AlphaZero style)
+    cpuct: float = Field(
+        default=1.25,
+        description="Constant determining the level of exploration (PUCT).",
+    )
+
+    # Dirichlet Noise (for root node exploration)
+    dirichlet_alpha: float = Field(
+        default=0.3, description="Alpha parameter for Dirichlet noise.", ge=0
+    )
+    dirichlet_epsilon: float = Field(
+        default=0.25,
+        description="Weight of Dirichlet noise in root prior probabilities.",
+        ge=0,
+        le=1.0,
+    )
+
+    # Discount Factor (Primarily for MuZero/Value Propagation)
+    discount: float = Field(
+        default=1.0,
+        description="Discount factor (gamma) for future rewards/values.",
+        ge=0.0,
+        le=1.0,
+    )
+
+    # Temperature (for action selection after search)
+    # Note: Temperature for selection *during* search is often implicitly 1.0
+    # This might be applied *after* getting visit counts from C++.
+    # We won't pass this to C++ for now, apply it in Python if needed.
+    # selection_temperature: float = Field(default=1.0, ge=0)
+
+    # Batching (Handled by C++ internally for now)
+    # virtual_loss: float = Field(default=1.0) # Common technique, add later if needed
+    # num_parallel_traversals: int = Field(default=8) # Add later if needed
+
+    # MuZero Specific (Add later)
+    # value_delta_max: float = Field(default=0.01) # MuZero specific
+
+    # Use ConfigDict for Pydantic V2
+    model_config = ConfigDict(validate_assignment=True)
+
+
+File: src/trimcts/mcts_wrapper.py
+import logging
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable, cast
+
+from .config import SearchConfiguration
+
+logger = logging.getLogger(__name__)
+
+# Type hint for the game state object expected by the network interfaces
+GameState = Any
+
+# --- Conditional Import for MyPy ---
+if TYPE_CHECKING:
+    from . import trimcts_cpp as trimcts_cpp_stub
+
+    trimcts_cpp: type[trimcts_cpp_stub]
+# --- End Conditional Import ---
+
+
+@runtime_checkable
+class AlphaZeroNetworkInterface(Protocol):
+    def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]: ...
+
+    def evaluate_batch(
+        self, states: list[GameState]
+    ) -> list[tuple[dict[int, float], float]]: ...
+
+
+@runtime_checkable
+class MuZeroNetworkInterface(Protocol):
+    def initial_inference(
+        self, state: GameState
+    ) -> tuple[dict[int, float], float, Any]: ...
+
+    def recurrent_inference(
+        self, hidden_state: Any, action: int
+    ) -> tuple[dict[int, float], float, Any]: ...
+
+
+def run_mcts(
+    root_state: GameState,
+    network_interface: AlphaZeroNetworkInterface | MuZeroNetworkInterface,
+    config: SearchConfiguration,
+) -> dict[int, int]:
+    """
+    Python entry point for running MCTS.
+
+    Returns empty dict immediately if root_state.is_over() is True.
+    """
+    # Terminal-state shortcut
+    if not hasattr(root_state, "is_over") or not callable(root_state.is_over):
+        raise TypeError("root_state object missing required method: is_over")
+    if root_state.is_over():
+        return {}
+
+    # Validate config
+    if not isinstance(config, SearchConfiguration):
+        raise TypeError("config must be an instance of SearchConfiguration")
+
+    # Import the C++ extension
+    try:
+        import trimcts.trimcts_cpp as cpp_module
+    except ImportError as e:
+        raise ImportError(
+            "TriMCTS C++ extension module ('trimcts.trimcts_cpp') not found or failed to import. "
+            "Ensure the package was built correctly (`pip install -e .`). "
+            f"Original error: {e}"
+        ) from e
+
+    # Ensure expected function exists
+    if not hasattr(cpp_module, "run_mcts_cpp"):
+        raise RuntimeError(
+            "Loaded module missing 'run_mcts_cpp'. Build might be incomplete or corrupted."
+        )
+
+    # Validate root_state capabilities
+    for method in ("copy", "step", "get_outcome", "valid_actions"):
+        if not hasattr(root_state, method) or not callable(getattr(root_state, method)):
+            raise TypeError(f"root_state object missing required method: {method}")
+
+    # Network interface type check
+    is_alpha = isinstance(network_interface, AlphaZeroNetworkInterface)
+    is_mu = isinstance(network_interface, MuZeroNetworkInterface)
+    if not is_alpha and not is_mu:
+        raise TypeError(
+            "network_interface must implement AlphaZeroNetworkInterface or MuZeroNetworkInterface"
+        )
+    if is_alpha and is_mu:
+        logger.warning(
+            "network_interface implements both AlphaZero and MuZero. Assuming AlphaZero."
+        )
+        is_mu = False
+
+    if is_mu:
+        raise NotImplementedError(
+            "MuZero MCTS integration is not yet implemented in C++ bindings."
+        )
+
+    # Call into C++
+    visit_counts = cast(
+        dict[int, int],
+        cpp_module.run_mcts_cpp(root_state, network_interface, config),
+    )
+
+    # Validate return type
+    if not isinstance(visit_counts, dict):
+        logger.error(f"C++ MCTS returned unexpected type: {type(visit_counts)}")
+        return {}
+
+    # Filter and validate keys/values
+    result: dict[int, int] = {}
+    for k, v in visit_counts.items():
+        if isinstance(k, int) and isinstance(v, int):
+            result[k] = v
+        else:
+            logger.warning(
+                f"Skipping invalid result entry: ({k!r}:{type(k)}, {v!r}:{type(v)})"
+            )
+    return result
+
+
+File: src/trimcts/__init__.py
+# File: src/trimcts/__init__.py
+"""
+TriMCTS Package
+
+Provides high-performance C++ MCTS bindings for Python.
+"""
+
+# Import only Python-defined elements here
+from .config import SearchConfiguration
+from .mcts_wrapper import AlphaZeroNetworkInterface, MuZeroNetworkInterface, run_mcts
+
+__all__ = [
+    "run_mcts",
+    "SearchConfiguration",
+    "AlphaZeroNetworkInterface",
+    "MuZeroNetworkInterface",
+]
+
+__version__ = "0.1.0"
+
+
+File: src/trimcts/cpp/CMakeLists.txt
+
+# File: src/trimcts/cpp/CMakeLists.txt
+
+cmake_minimum_required(VERSION 3.14)
+project(trimcts_cpp LANGUAGES CXX)
+
+# Locate Python and Pybind11 using variables passed from setup.py
+# These hints help CMake find the correct Python installation from the venv
+find_package(Python REQUIRED COMPONENTS Interpreter Development)
+find_package(pybind11 CONFIG REQUIRED)
+
+# Sources
+set(TRIMCTS_SOURCES
+    bindings.cpp
+    mcts.cpp
+)
+
+# Build the pybind11 module
+pybind11_add_module(trimcts_cpp MODULE ${TRIMCTS_SOURCES})
+
+# Link against Python libraries
+target_link_libraries(trimcts_cpp PRIVATE Python::Module)
+
+# C++17 Standard
+target_compile_features(trimcts_cpp PRIVATE cxx_std_17)
+
+# Optimisation flags and visibility
+if(MSVC)
+  target_compile_options(trimcts_cpp PRIVATE /O2)
+else()
+  target_compile_options(trimcts_cpp PRIVATE -O3 -DNDEBUG)
+  # Symbol visibility for non-Apple Unix-like systems
+  if(NOT APPLE)
+    target_compile_options(trimcts_cpp PRIVATE -fvisibility=hidden)
+  endif()
+endif()
+
+# Output directory is now set via CMAKE_LIBRARY_OUTPUT_DIRECTORY in setup.py
+# No need to set target properties here for output location.
+message(STATUS "Python Executable: ${Python_EXECUTABLE}")
+message(STATUS "Python Include Dir: ${Python_INCLUDE_DIR}")
+message(STATUS "Python Libraries: ${Python_LIBRARIES}")
+message(STATUS "pybind11 Include Dirs: ${pybind11_INCLUDE_DIRS}")
+message(STATUS "Building C++ extension for TriMCTS version ${TRIMCTS_VERSION_INFO}")
+
+File: src/trimcts/cpp/config.h
+
+#pragma once
+
+#include <cstdint> // For uint32_t etc.
+
+namespace trimcts {
+
+// Matches the Python SearchConfiguration Pydantic model
+struct SearchConfig {
+    uint32_t max_simulations = 50;
+    uint32_t max_depth = 10;
+    double cpuct = 1.25;
+    double dirichlet_alpha = 0.3;
+    double dirichlet_epsilon = 0.25;
+    double discount = 1.0;
+    // Add other fields as needed
+};
+
+} // namespace trimcts
+
+File: src/trimcts/cpp/python_interface.h
+// File: src/trimcts/cpp/python_interface.h
+#pragma once
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h> // For automatic vector/map conversions
+#include <vector>
+#include <map>       // Added for std::map
+#include <stdexcept> // For std::runtime_error
+#include <string>
+
+namespace py = pybind11;
+
+namespace trimcts
+{
+
+  // Define basic types used across C++/Python
+  using Action = int;
+  using Value = float;
+  using PolicyMap = std::map<Action, float>;
+  using VisitMap = std::map<Action, int>; // Fixed alias
+
+  // Helper struct to hold evaluation results from Python network
+  struct NetworkOutput
+  {
+    PolicyMap policy;
+    Value value;
+  };
+
+  // --- Helper functions to interact with Python objects ---
+
+  inline py::object call_python_method(py::handle obj, const char *method_name)
+  {
+    try
+    {
+      return obj.attr(method_name)();
+    }
+    catch (py::error_already_set &e)
+    {
+      throw std::runtime_error("Python error in method '" + std::string(method_name) + "': " + e.what());
+    }
+    catch (const std::exception &e)
+    {
+      throw std::runtime_error("C++ error calling method '" + std::string(method_name) + "': " + e.what());
+    }
+  }
+
+  template <typename Arg>
+  inline py::object call_python_method(py::handle obj, const char *method_name, Arg &&arg)
+  {
+    try
+    {
+      return obj.attr(method_name)(std::forward<Arg>(arg));
+    }
+    catch (py::error_already_set &e)
+    {
+      throw std::runtime_error("Python error in method '" + std::string(method_name) + "': " + e.what());
+    }
+    catch (const std::exception &e)
+    {
+      throw std::runtime_error("C++ error calling method '" + std::string(method_name) + "': " + e.what());
+    }
+  }
+
+  // --- Game State Interface ---
+  // These functions call methods on the Python GameState object
+
+  inline py::object copy_state(py::handle py_state)
+  {
+    return call_python_method(py_state, "copy");
+  }
+
+  inline bool is_terminal(py::handle py_state)
+  {
+    return call_python_method(py_state, "is_over").cast<bool>();
+  }
+
+  inline Value get_outcome(py::handle py_state)
+  {
+    // AlphaZero expects outcome only for terminal states
+    if (!is_terminal(py_state))
+    {
+      return 0.0f; // Return 0 for non-terminal states
+    }
+    return call_python_method(py_state, "get_outcome").cast<Value>();
+  }
+
+  inline std::vector<Action> get_valid_actions(py::handle py_state)
+  {
+    py::object result = call_python_method(py_state, "valid_actions");
+    try
+    {
+      return result.cast<std::vector<Action>>();
+    }
+    catch (const py::cast_error &)
+    {
+      try
+      {
+        py::set py_set = result.cast<py::set>();
+        std::vector<Action> actions;
+        actions.reserve(py_set.size());
+        for (py::handle item : py_set)
+        {
+          actions.push_back(item.cast<Action>());
+        }
+        return actions;
+      }
+      catch (const py::cast_error &)
+      {
+        throw std::runtime_error("Python 'valid_actions' must return list or set of int.");
+      }
+    }
+  }
+
+  // Apply the action in-place; no return value needed
+  inline void apply_action(py::handle py_state, Action action)
+  {
+    call_python_method(py_state, "step", action);
+  }
+
+  // --- Network Interface for AlphaZero ---
+
+  inline NetworkOutput evaluate_state_alpha(py::handle py_network, py::handle py_state)
+  {
+    py::tuple result = call_python_method(py_network, "evaluate_state", py_state).cast<py::tuple>();
+    if (result.size() != 2)
+      throw std::runtime_error("Python 'evaluate_state' must return (policy_dict, value).");
+    PolicyMap policy = result[0].cast<PolicyMap>();
+    Value value = result[1].cast<Value>();
+    return {policy, value};
+  }
+
+  inline std::vector<NetworkOutput> evaluate_batch_alpha(
+      py::handle py_network,
+      const std::vector<py::object> &py_states)
+  {
+    py::list state_list = py::cast(py_states);
+    py::list results_list = call_python_method(py_network, "evaluate_batch", state_list).cast<py::list>();
+
+    if (results_list.size() != py_states.size())
+      throw std::runtime_error("Python 'evaluate_batch' returned wrong length.");
+
+    std::vector<NetworkOutput> outputs;
+    outputs.reserve(py_states.size());
+    for (auto item : results_list)
+    {
+      py::tuple tup = item.cast<py::tuple>();
+      if (tup.size() != 2)
+        throw std::runtime_error("Each 'evaluate_batch' item must be (policy_dict, value).");
+      outputs.push_back({tup[0].cast<PolicyMap>(), tup[1].cast<Value>()});
+    }
+    return outputs;
+  }
+
+  // (MuZero interfaces to be added later)
+
+} // namespace trimcts
+
+
+File: src/trimcts/cpp/mcts.cpp
+
+#include "mcts.h"
+#include "python_interface.h" // For Python interaction
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <iostream> // For temporary debugging
+#include <numeric>  // For std::accumulate
+#include <vector>
+#include <algorithm> // For std::max_element
+
+namespace trimcts
+{
+
+  // --- Node Implementation ---
+
+  Node::Node(py::object state, Node *parent, Action action, float prior)
+      : parent_(parent), action_taken_(action), state_(std::move(state)), prior_probability_(prior) {}
+
+  bool Node::is_expanded() const
+  {
+    return !children_.empty();
+  }
+
+  bool Node::is_terminal() const
+  {
+    // Call Python's is_over() method
+    return trimcts::is_terminal(state_);
+  }
+
+  float Node::get_value_estimate() const
+  {
+    if (visit_count_ == 0)
+    {
+      return 0.0f;
+    }
+    // Cast to float for return type consistency
+    return static_cast<float>(total_action_value_ / visit_count_);
+  }
+
+  float Node::calculate_puct(const SearchConfig &config) const
+  {
+    // PUCT formula: Q(s,a) + C_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
+    // Here, 'this' node represents the child (s,a)
+    // Q(s,a) is the value estimate of this child node
+    // P(s,a) is the prior probability of this child node
+    // N(s) is the visit count of the parent node
+    // N(s,a) is the visit count of this child node
+
+    if (!parent_)
+    {
+      // Should not happen for child selection, but handle defensively
+      return -std::numeric_limits<float>::infinity();
+    }
+
+    float q_value = get_value_estimate();
+    double parent_visits_sqrt = std::sqrt(static_cast<double>(std::max(1, parent_->visit_count_)));
+    double exploration_term = config.cpuct * prior_probability_ * (parent_visits_sqrt / (1.0 + visit_count_));
+
+    return q_value + static_cast<float>(exploration_term);
+  }
+
+  Node *Node::select_child(const SearchConfig &config)
+  {
+    if (!is_expanded())
+    {
+      return nullptr; // Cannot select child if not expanded
+    }
+
+    Node *best_child = nullptr;
+    float max_score = -std::numeric_limits<float>::infinity();
+
+    for (auto const &[action, child_ptr] : children_)
+    {
+      float score = child_ptr->calculate_puct(config);
+      if (score > max_score)
+      {
+        max_score = score;
+        best_child = child_ptr.get();
+      }
+    }
+    return best_child; // Can be nullptr if children_ is empty (shouldn't happen if is_expanded is true)
+  }
+
+  void Node::expand(const PolicyMap &policy_map)
+  {
+    if (is_expanded() || is_terminal())
+    {
+      return; // Don't expand if already expanded or terminal
+    }
+
+    std::vector<Action> valid_actions = trimcts::get_valid_actions(state_);
+    if (valid_actions.empty())
+    {
+      // Handle case where Python state says not terminal but has no actions
+      // This might indicate an issue in the Python state logic or MCTS reached a dead end
+      // For now, just don't expand. Consider logging a warning.
+      std::cerr << "Warning: Node::expand called on non-terminal state with no valid actions." << std::endl;
+      return;
+    }
+
+    for (Action action : valid_actions)
+    {
+      float prior = 0.0f;
+      auto it = policy_map.find(action);
+      if (it != policy_map.end())
+      {
+        prior = it->second;
+      }
+
+      // Create next state by copying and applying action (calls Python)
+      py::object next_state_py = trimcts::copy_state(state_);
+      trimcts::apply_action(next_state_py, action); // Modifies next_state_py in-place
+
+      // Create the child node
+      children_[action] = std::make_unique<Node>(std::move(next_state_py), this, action, prior);
+    }
+  }
+
+  void Node::backpropagate(float value)
+  {
+    Node *current = this;
+    while (current != nullptr)
+    {
+      current->visit_count_++;
+      current->total_action_value_ += value;
+      current = current->parent_;
+    }
+  }
+
+  // Simple gamma distribution for Dirichlet noise (replace with proper library if needed)
+  // This is a placeholder and likely not statistically correct for true Dirichlet.
+  void sample_dirichlet_simple(double alpha, size_t k, std::vector<double> &output, std::mt19937 &rng)
+  {
+    output.resize(k);
+    std::gamma_distribution<double> dist(alpha, 1.0);
+    double sum = 0.0;
+    for (size_t i = 0; i < k; ++i)
+    {
+      output[i] = dist(rng);
+      if (output[i] < 1e-9)
+        output[i] = 1e-9; // Avoid zero
+      sum += output[i];
+    }
+    if (sum > 1e-9)
+    {
+      for (size_t i = 0; i < k; ++i)
+      {
+        output[i] /= sum;
+      }
+    }
+    else
+    { // Handle sum near zero case (e.g., all samples were tiny)
+      for (size_t i = 0; i < k; ++i)
+      {
+        output[i] = 1.0 / k;
+      }
+    }
+  }
+
+  void Node::add_dirichlet_noise(const SearchConfig &config, std::mt19937 &rng)
+  {
+    if (children_.empty() || config.dirichlet_alpha <= 0 || config.dirichlet_epsilon <= 0)
+    {
+      return;
+    }
+
+    size_t num_children = children_.size();
+    std::vector<double> noise;
+    sample_dirichlet_simple(config.dirichlet_alpha, num_children, noise, rng); // Use simple placeholder
+
+    size_t i = 0;
+    double total_prior = 0.0;
+    for (auto &[action, child_ptr] : children_)
+    {
+      child_ptr->prior_probability_ = (1.0f - config.dirichlet_epsilon) * child_ptr->prior_probability_ + config.dirichlet_epsilon * static_cast<float>(noise[i]);
+      total_prior += child_ptr->prior_probability_;
+      i++;
+    }
+
+    // Re-normalize (optional, but good practice if noise addition causes drift)
+    if (std::abs(total_prior - 1.0) > 1e-6 && total_prior > 1e-9)
+    {
+      for (auto &[action, child_ptr] : children_)
+      {
+        child_ptr->prior_probability_ /= static_cast<float>(total_prior);
+      }
+    }
+  }
+
+  // --- MCTS Main Logic ---
+
+  VisitMap run_mcts_cpp_internal(
+      py::object root_state_py,
+      py::object network_interface_py, // AlphaZero interface for now
+      const SearchConfig &config)
+  {
+    // Basic check: Ensure root state is not terminal
+    if (trimcts::is_terminal(root_state_py))
+    {
+      std::cerr << "Error: MCTS called on a terminal root state." << std::endl;
+      return {}; // Return empty map
+    }
+
+    // Create root node
+    Node root(std::move(root_state_py));
+    std::mt19937 rng(std::random_device{}()); // Random number generator for noise
+
+    // Initial evaluation and expansion of the root
+    try
+    {
+      NetworkOutput root_eval = trimcts::evaluate_state_alpha(network_interface_py, root.state_);
+      root.expand(root_eval.policy);
+      if (root.is_expanded())
+      {
+        root.add_dirichlet_noise(config, rng);
+      }
+      else if (!root.is_terminal())
+      {
+        std::cerr << "Warning: Root node failed to expand." << std::endl;
+        // If root didn't expand but isn't terminal, MCTS can't proceed meaningfully
+        return {};
+      }
+      // Backpropagate initial root value estimate (optional, depends on exact AlphaZero variant)
+      // root.backpropagate(root_eval.value); // Let's skip this for now, value comes from simulations
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "Error during MCTS root initialization: " << e.what() << std::endl;
+      return {};
+    }
+
+    for (uint32_t i = 0; i < config.max_simulations; ++i)
+    {
+      Node *current_node = &root;
+      std::vector<Node *> path;
+      path.push_back(current_node);
+      int depth = 0;
+
+      // 1. Selection
+      while (current_node->is_expanded() && !current_node->is_terminal())
+      {
+        current_node = current_node->select_child(config);
+        if (!current_node)
+        {
+          std::cerr << "Error: Selection returned nullptr." << std::endl;
+          goto next_simulation; // Skip to next simulation on error
+        }
+        path.push_back(current_node);
+        depth++;
+        if (depth >= config.max_depth)
+          break; // Stop if max depth reached
+      }
+
+      // 2. Expansion & Evaluation
+      Value value;
+      if (!current_node->is_terminal() && depth < config.max_depth)
+      {
+        try
+        {
+          // Evaluate the leaf node
+          NetworkOutput leaf_eval = trimcts::evaluate_state_alpha(network_interface_py, current_node->state_);
+          value = leaf_eval.value;
+          // Expand the leaf node
+          current_node->expand(leaf_eval.policy);
+        }
+        catch (const std::exception &e)
+        {
+          std::cerr << "Error during MCTS expansion/evaluation: " << e.what() << std::endl;
+          // Decide how to handle evaluation errors, e.g., backpropagate 0 or skip
+          value = 0.0; // Backpropagate neutral value on error
+        }
+      }
+      else
+      {
+        // If terminal or max depth reached, use the terminal outcome or current estimate
+        value = current_node->is_terminal() ? trimcts::get_outcome(current_node->state_) : current_node->get_value_estimate();
+      }
+
+      // 3. Backpropagation
+      current_node->backpropagate(value); // Backpropagate from the leaf (or max depth node)
+
+    next_simulation:; // Label for goto
+    }
+
+    // Collect visit counts from root's children
+    VisitMap visit_counts;
+    for (auto const &[action, child_ptr] : root.children_)
+    {
+      visit_counts[action] = child_ptr->visit_count_;
+    }
+
+    return visit_counts;
+  }
+
+} // namespace trimcts
+
+File: src/trimcts/cpp/mcts.h
+
+#pragma once
+
+#include <pybind11/pybind11.h> // Include pybind11 first
+#include <vector>
+#include <map>
+#include <memory> // For std::unique_ptr
+#include <random>
+
+#include "config.h"
+#include "python_interface.h" // For types and Python interaction helpers
+
+namespace py = pybind11;
+
+namespace trimcts
+{
+
+  class Node
+  {
+  public:
+    Node(py::object state, Node *parent = nullptr, Action action = -1, float prior = 0.0);
+    ~Node() = default; // Use default destructor
+
+    // Disable copy constructor and assignment operator
+    Node(const Node &) = delete;
+    Node &operator=(const Node &) = delete;
+
+    // Enable move constructor and assignment operator (optional, but good practice)
+    Node(Node &&) = default;
+    Node &operator=(Node &&) = default;
+
+    bool is_expanded() const;
+    bool is_terminal() const;
+    float get_value_estimate() const;
+    Node *select_child(const SearchConfig &config);
+    void expand(const PolicyMap &policy_map);
+    void backpropagate(float value);
+    void add_dirichlet_noise(const SearchConfig &config, std::mt19937 &rng);
+
+    // --- Public Members (Consider making some private with getters/setters) ---
+    Node *parent_;
+    Action action_taken_; // Action that led to this node
+    py::object state_;    // Python GameState object
+    std::map<Action, std::unique_ptr<Node>> children_;
+
+    int visit_count_ = 0;
+    double total_action_value_ = 0.0; // Use double for accumulation
+    float prior_probability_ = 0.0;
+
+  private:
+    float calculate_puct(const SearchConfig &config) const;
+  };
+
+  // Main MCTS function signature
+  VisitMap run_mcts_cpp_internal(
+      py::object root_state,
+      py::object network_interface, // AlphaZero interface for now
+      const SearchConfig &config);
+
+} // namespace trimcts
+
+File: src/trimcts/cpp/bindings.cpp
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>     // For map/vector conversions
+#include <pybind11/pytypes.h> // For py::object, py::handle
+
+#include "mcts.h"             // Include your MCTS logic header
+#include "config.h"           // Include your config struct header
+#include "python_interface.h" // For types
+
+namespace py = pybind11;
+namespace tc = trimcts; // Alias for your C++ namespace
+
+// Helper function to transfer config from Python Pydantic model to C++ struct
+tc::SearchConfig python_to_cpp_config(const py::object &py_config)
+{
+  tc::SearchConfig cpp_config;
+  // Use py::getattr with default values or checks
+  if (py::hasattr(py_config, "max_simulations"))
+  {
+    cpp_config.max_simulations = py_config.attr("max_simulations").cast<uint32_t>();
+  }
+  if (py::hasattr(py_config, "max_depth"))
+  {
+    cpp_config.max_depth = py_config.attr("max_depth").cast<uint32_t>();
+  }
+  if (py::hasattr(py_config, "cpuct"))
+  {
+    cpp_config.cpuct = py_config.attr("cpuct").cast<double>();
+  }
+  if (py::hasattr(py_config, "dirichlet_alpha"))
+  {
+    cpp_config.dirichlet_alpha = py_config.attr("dirichlet_alpha").cast<double>();
+  }
+  if (py::hasattr(py_config, "dirichlet_epsilon"))
+  {
+    cpp_config.dirichlet_epsilon = py_config.attr("dirichlet_epsilon").cast<double>();
+  }
+  if (py::hasattr(py_config, "discount"))
+  {
+    cpp_config.discount = py_config.attr("discount").cast<double>();
+  }
+  // Add other fields as needed
+  return cpp_config;
+}
+
+// Wrapper function exposed to Python
+tc::VisitMap run_mcts_cpp_wrapper(
+    py::object root_state_py,
+    py::object network_interface_py,
+    const py::object &config_py // Pass Python config object
+)
+{
+  // Convert Python config to C++ config struct
+  tc::SearchConfig config_cpp = python_to_cpp_config(config_py);
+
+  // Call the internal C++ MCTS implementation
+  // Add error handling around the C++ call
+  try
+  {
+    return tc::run_mcts_cpp_internal(root_state_py, network_interface_py, config_cpp);
+  }
+  catch (const std::exception &e)
+  {
+    // Convert C++ exceptions to Python exceptions
+    throw py::value_error(std::string("Error in C++ MCTS execution: ") + e.what());
+  }
+  catch (const py::error_already_set &e)
+  {
+    // Propagate Python exceptions that occurred during callbacks
+    throw; // Re-throw the Python exception
+  }
+}
+
+PYBIND11_MODULE(trimcts_cpp, m)
+{                                          // Module name must match CMakeExtension and import
+  m.doc() = "C++ core module for TriMCTS"; // Optional module docstring
+
+  // Expose the main MCTS function
+  m.def("run_mcts_cpp", &run_mcts_cpp_wrapper,
+        py::arg("root_state"), py::arg("network_interface"), py::arg("config"),
+        "Runs MCTS simulations from the root state using the provided network interface and configuration (C++).");
+
+  // Optional: Expose the C++ Node class if needed for debugging or advanced usage
+  /*
+  py::class_<tc::Node>(m, "NodeCpp")
+      .def(py::init<py::object, tc::Node*, tc::Action, float>(),
+           py::arg("state"), py::arg("parent") = nullptr, py::arg("action") = -1, py::arg("prior") = 0.0f)
+      .def_property_readonly("visit_count", [](const tc::Node &n){ return n.visit_count_; })
+      .def_property_readonly("value_estimate", &tc::Node::get_value_estimate)
+      // Add other methods/properties as needed
+      ;
+  */
+
+  // Optional: Expose the C++ SearchConfig struct if needed
+  /*
+   py::class_<tc::SearchConfig>(m, "SearchConfigCpp")
+      .def(py::init<>())
+      .def_readwrite("max_simulations", &tc::SearchConfig::max_simulations)
+      .def_readwrite("max_depth", &tc::SearchConfig::max_depth)
+      .def_readwrite("cpuct", &tc::SearchConfig::cpuct)
+      // ... other fields
+      ;
+  */
+
+#ifdef VERSION_INFO
+  m.attr("__version__") = MACRO_STRINGIFY(VERSION_INFO);
+#else
+  m.attr("__version__") = "dev";
+#endif
+}
+
+File: src/trimcts.egg-info/PKG-INFO
+Metadata-Version: 2.4
+Name: trimcts
+Version: 0.1.0
+Summary: High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games
+Author-email: "Luis Guilherme P. M." <lgpelin92@gmail.com>
+License: 
+        MIT License
+        
+        Copyright (c) 2024 Luis Guilherme P. M.
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+Project-URL: Homepage, https://github.com/lguibr/trimcts
+Project-URL: Bug Tracker, https://github.com/lguibr/trimcts/issues
+Classifier: Development Status :: 3 – Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: C++
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: trianglengin>=1.0.6
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+Dynamic: license-file
+
+
+# TriMCTS
+
+[![CI](https://github.com/lguibr/trimcts/actions/workflows/ci.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
+[![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
+[![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- TODO: Add Codecov token -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+**TriMCTS** is an installable Python package providing C++ bindings for Monte Carlo Tree Search, supporting both AlphaZero and MuZero paradigms, optimized for triangular grid games like the one in `trianglengin`.
+
+## 🔑 Key Features
+
+-   High-performance C++ core implementation.
+-   Seamless Python integration via Pybind11.
+-   Supports AlphaZero-style evaluation (policy/value from state).
+-   (Planned) Supports MuZero-style evaluation (initial inference + recurrent inference).
+-   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise).
+-   Designed for use with external Python game state objects and network evaluators.
+
+## 🚀 Installation
+
+```bash
+# From PyPI (once published)
+pip install trimcts
+
+# For development (from cloned repo root)
+# Ensure you clean previous builds if you encounter issues:
+# rm -rf build/ src/trimcts.egg-info/ dist/
+pip install -e .[dev]
+```
+
+## 💡 Usage Example (AlphaZero Style)
+
+```python
+import time
+import numpy as np
+import torch # Added import
+from trianglengin.core.environment import GameState # Example state object
+from trianglengin.config import EnvConfig
+# Assuming alphatriangle is installed and provides these:
+# from alphatriangle.nn import NeuralNetwork # Example network wrapper
+# from alphatriangle.config import ModelConfig, TrainConfig
+
+from trimcts import run_mcts, SearchConfiguration, AlphaZeroNetworkInterface
+
+# --- Mock Neural Network for demonstration ---
+# Replace with your actual network implementation
+class MockNeuralNetwork:
+    def __init__(self, *args, **kwargs):
+        self.model = torch.nn.Module() # Dummy model
+        print("MockNeuralNetwork initialized.")
+
+    def evaluate(self, state: GameState) -> tuple[dict[int, float], float]:
+        # Mock evaluation: uniform policy over valid actions, fixed value
+        valid_actions = state.valid_actions()
+        if not valid_actions:
+            return {}, 0.0 # Terminal or no valid actions
+        policy = {action: 1.0 / len(valid_actions) for action in valid_actions}
+        value = 0.5 # Fixed mock value
+        return policy, value
+
+    def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
+        return [self.evaluate(s) for s in states]
+
+    def load_weights(self, path):
+        print(f"Mock: Pretending to load weights from {path}")
+
+    def to(self, device):
+        print(f"Mock: Pretending to move model to {device}")
+        return self
+# --- End Mock Neural Network ---
+
+
+# 1. Define your AlphaZero network wrapper conforming to the interface
+class MyAlphaZeroWrapper(AlphaZeroNetworkInterface):
+    def __init__(self, model_path: str | None = None):
+        # Load your PyTorch/TensorFlow/etc. model here
+        # Example using a Mock NeuralNetwork
+        env_cfg = EnvConfig()
+        # model_cfg = ModelConfig() # Assuming these exist if using alphatriangle
+        # train_cfg = TrainConfig(DEVICE="cpu")
+        self.network = MockNeuralNetwork() # Using Mock for this example
+        # Load weights if model_path is provided
+        if model_path:
+             self.network.load_weights(model_path)
+        # self.network.to(torch.device("cpu")) # Ensure model is on correct device if using real NN
+        self.network.model.eval() # Set to evaluation mode
+        print("MyAlphaZeroWrapper initialized.")
+
+    def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
+        """
+        Evaluates a single game state.
+
+        Args:
+            state: The GameState object (passed from C++).
+
+        Returns:
+            A tuple containing:
+                - Policy dict: {action_index: probability}
+                - Value estimate: float
+        """
+        print(f"Python: Evaluating state step {state.current_step}")
+        # Use the evaluate method of your network wrapper
+        # Add necessary state transformations if your network expects specific input format
+        # e.g., state_tensor = self.transform_state(state)
+        # policy_logits, value_logit = self.network.model(state_tensor)
+        # policy_map = self.process_policy(policy_logits, state.valid_actions())
+        # value = torch.tanh(value_logit).item() # Example processing
+        policy_map, value = self.network.evaluate(state) # Using mock evaluate directly
+        print(f"Python: Evaluation result - Policy keys: {len(policy_map)}, Value: {value:.4f}")
+        return policy_map, value
+
+    def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
+        """
+        Evaluates a batch of game states.
+
+        Args:
+            states: A list of GameState objects.
+
+        Returns:
+            A list of tuples, each containing (policy_dict, value_estimate).
+        """
+        print(f"Python: Evaluating batch of {len(states)} states.")
+        # Use the evaluate_batch method of your network wrapper
+        # Add necessary state transformations and batching if needed
+        # e.g., batch_tensor = self.transform_batch(states)
+        # policy_logits_batch, value_logit_batch = self.network.model(batch_tensor)
+        # results = self.process_batch_output(policy_logits_batch, value_logit_batch, states)
+        results = self.network.evaluate_batch(states) # Using mock evaluate_batch directly
+        print(f"Python: Batch evaluation returned {len(results)} results.")
+        return results
+
+# 2. Instantiate your game state and network wrapper
+env_config = EnvConfig()
+# Ensure the config creates a playable state for the example
+env_config.ROWS = 3
+env_config.COLS = 3
+env_config.NUM_SHAPE_SLOTS = 1
+env_config.PLAYABLE_RANGE_PER_ROW = [(0,3), (0,3), (0,3)] # Example playable range
+
+root_state = GameState(config=env_config, initial_seed=42)
+network_wrapper = MyAlphaZeroWrapper() # Add path to your trained model if needed
+
+# 3. Configure MCTS parameters
+mcts_config = SearchConfiguration()
+mcts_config.max_simulations = 50
+mcts_config.max_depth = 10
+mcts_config.cpuct = 1.25
+mcts_config.dirichlet_alpha = 0.3
+mcts_config.dirichlet_epsilon = 0.25
+mcts_config.discount = 1.0 # AlphaZero typically uses no discount during search
+
+# 4. Run MCTS
+# The C++ run_mcts function will call network_wrapper.evaluate_batch() or evaluate_state()
+print("Running MCTS...")
+# Ensure root_state is not terminal before running
+if not root_state.is_over():
+    # run_mcts returns a dictionary: {action: visit_count}
+    start_time = time.time()
+    visit_counts = run_mcts(root_state, network_wrapper, mcts_config)
+    end_time = time.time()
+    print(f"\nMCTS Result (Visit Counts) after {end_time - start_time:.2f} seconds:")
+    print(visit_counts)
+
+    # Example: Select best action based on visits
+    if visit_counts:
+        best_action = max(visit_counts, key=visit_counts.get)
+        print(f"\nBest action based on visits: {best_action}")
+    else:
+        print("\nNo actions explored or MCTS failed.")
+else:
+    print("Root state is already terminal. Cannot run MCTS.")
+
+```
+
+*(MuZero example will be added later)*
+
+## 📂 Project Structure
+
+```
+trimcts/
+├── .github/workflows/      # CI configuration (link to workflow file)
+├── src/trimcts/            # Python package source (link to src/trimcts/README.md if exists)
+│   ├── cpp/                # C++ source code (link to src/trimcts/cpp/README.md if exists)
+│   │   ├── CMakeLists.txt  # CMake build script for C++ part
+│   │   ├── bindings.cpp    # Pybind11 bindings
+│   │   ├── config.h        # C++ configuration struct
+│   │   ├── mcts.cpp        # C++ MCTS implementation
+│   │   ├── mcts.h          # C++ MCTS header
+│   │   └── python_interface.h # C++ helpers for Python interaction
+│   ├── __init__.py         # Exposes public API (run_mcts, configs, etc.)
+│   ├── config.py           # Python SearchConfiguration (Pydantic)
+│   └── mcts_wrapper.py     # Python network interface definition
+├── tests/                  # Python tests (link to tests/README.md if exists)
+│   ├── conftest.py
+│   └── test_alpha_wrapper.py # Tests for AlphaZero functionality
+├── .gitignore
+├── LICENSE
+├── MANIFEST.in             # Specifies files for source distribution
+├── pyproject.toml          # Build system & package configuration
+├── README.md               # This file
+└── setup.py                # Setup script for C++ extension building
+```
+
+## 🛠️ Building from Source
+
+1.  Clone the repository: `git clone https://github.com/lguibr/trimcts.git`
+2.  Navigate to the directory: `cd trimcts`
+3.  **Recommended:** Create and activate a virtual environment:
+    ```bash
+    python -m venv .venv
+    source .venv/bin/activate # On Windows use `.venv\Scripts\activate`
+    ```
+4.  Install build dependencies: `pip install pybind11>=2.10 cmake wheel`
+5.  **Clean previous builds (important if switching Python versions or encountering issues):**
+    ```bash
+    rm -rf build/ src/trimcts.egg-info/ dist/ src/trimcts/trimcts_cpp.*.so
+    ```
+6.  Install the package in editable mode: `pip install -e .`
+
+## 🧪 Running Tests
+
+```bash
+# Make sure you have installed dev dependencies
+pip install -e .[dev]
+pytest
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! Please follow standard fork-and-pull-request workflow. Ensure tests pass and code adheres to formatting/linting standards (Ruff).
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+
+File: src/trimcts.egg-info/SOURCES.txt
+LICENSE
+MANIFEST.in
+README.md
+pyproject.toml
+setup.py
+src/trimcts/__init__.py
+src/trimcts/config.py
+src/trimcts/mcts_wrapper.py
+src/trimcts.egg-info/PKG-INFO
+src/trimcts.egg-info/SOURCES.txt
+src/trimcts.egg-info/dependency_links.txt
+src/trimcts.egg-info/not-zip-safe
+src/trimcts.egg-info/requires.txt
+src/trimcts.egg-info/top_level.txt
+src/trimcts/cpp/CMakeLists.txt
+src/trimcts/cpp/bindings.cpp
+src/trimcts/cpp/config.h
+src/trimcts/cpp/mcts.cpp
+src/trimcts/cpp/mcts.h
+src/trimcts/cpp/python_interface.h
+tests/test_alpha_wrapper.py
+
+File: src/trimcts.egg-info/requires.txt
+numpy>=1.20.0
+pydantic>=2.0.0
+trianglengin>=1.0.6
+
+[dev]
+pytest>=7.0
+pytest-cov
+ruff
+mypy
+
+
+File: src/trimcts.egg-info/top_level.txt
+trimcts
+
+
+File: src/trimcts.egg-info/dependency_links.txt
+
+
+
