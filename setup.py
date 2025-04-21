@@ -54,12 +54,10 @@ class CMakeBuild(build_ext):
             if candidate.exists():
                 python_library_file = str(candidate.resolve())
             else:
-                # Sometimes LIBRARY might include the lib prefix/suffix, sometimes not
-                # Try finding based on common patterns if the direct path fails
                 potential_lib_names = [
                     f"libpython{sysconfig.get_python_version()}.a",
                     f"libpython{sysconfig.get_python_version()}.dylib",
-                    f"python{sys.version_info.major}{sys.version_info.minor}.lib",  # Windows
+                    f"python{sys.version_info.major}{sys.version_info.minor}.lib",
                 ]
                 for name in potential_lib_names:
                     candidate = Path(libdir) / name
@@ -67,11 +65,9 @@ class CMakeBuild(build_ext):
                         python_library_file = str(candidate.resolve())
                         break
 
-        # If still not found, try sysconfig.get_config_var('LIBPL') as last resort directory
         if not python_library_file:
             libpl = sysconfig.get_config_var("LIBPL")
             if libpl and Path(libpl).is_dir():
-                # Check common library names within LIBPL
                 for name in potential_lib_names:
                     candidate = Path(libpl) / name
                     if candidate.exists():
@@ -86,25 +82,33 @@ class CMakeBuild(build_ext):
             )
         print(f"Found Pybind11 CMake directory: {pybind11_cmake_dir}")
 
+        # Determine if CMake generator is multi-config (e.g., Visual Studio)
+        is_multi_config = any(x in cmake_generator for x in {"Visual Studio", "Xcode"})
+
+        # Adjust output directory for multi-config generators
+        cmake_library_output_dir = extdir
+        if is_multi_config and self.compiler.compiler_type == "msvc":
+            # For MSVC multi-config, append the config type to the output path
+            # This tells CMake to put the final artifact directly where setuptools expects it
+            cmake_library_output_dir = extdir.joinpath(cfg)
+            cmake_library_output_dir.mkdir(
+                parents=True, exist_ok=True
+            )  # Ensure the target dir exists
+
         cmake_args = [
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
+            # Use the potentially adjusted output directory
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={cmake_library_output_dir}",
             f"-DPython_EXECUTABLE={python_executable}",
             f"-DPython_INCLUDE_DIR={python_include_dir}",
-            # Only pass Python_LIBRARIES if we found the specific file
             f"-DPython_LIBRARIES={python_library_file}" if python_library_file else "",
             f"-DCMAKE_BUILD_TYPE={cfg}",
-            # Pass Pybind11 CMake directory hint
             f"-Dpybind11_DIR={pybind11_cmake_dir}",
-            # These might not be strictly necessary if pybind11_DIR is set, but keep for robustness
             "-Dpybind11_FINDPYTHON=ON",
             "-DPython_FIND_STRATEGY=LOCATION",
         ]
-        # Filter out empty strings from cmake_args (like potentially empty Python_LIBRARIES)
         cmake_args = [arg for arg in cmake_args if arg]
 
-        # --- Rest of the CMake configuration and build steps remain the same ---
-
-        # CMake generator and platform handling
+        # Platform specific args
         if sys.platform.startswith("darwin"):
             archs = re.findall(r"-arch (\S+)", os.environ.get("ARCHFLAGS", ""))
             if archs:
@@ -117,12 +121,13 @@ class CMakeBuild(build_ext):
 
         build_args = ["--config", cfg]
 
+        # MSVC specific build args
         if self.compiler.compiler_type == "msvc":
-            single_config = any(x in cmake_generator for x in {"NMake", "Ninja"})
-            contains_arch = any(x in cmake_generator for x in {"ARM", "Win64"})
-            if not single_config and not contains_arch:
+            # Add platform specifier for VS generators
+            if not any(x in cmake_generator for x in {"NMake", "Ninja"}):
                 cmake_args += ["-A", PLAT_TO_CMAKE[self.plat_name]]
-            if not single_config:
+            # Add parallel build flag for MSBuild
+            if not any(x in cmake_generator for x in {"NMake", "Ninja"}):
                 build_args += ["--", "/m"]
 
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
@@ -131,12 +136,10 @@ class CMakeBuild(build_ext):
 
         # --- Build Execution ---
         build_temp = Path(self.build_temp) / ext.name
-        build_temp.mkdir(parents=True, exist_ok=True)  # Ensure build temp exists
+        build_temp.mkdir(parents=True, exist_ok=True)
 
         print("-" * 10, "Running CMake prepare", "-" * 40)
-        print(
-            f"CMake command: cmake {ext.sourcedir} {' '.join(cmake_args)}"
-        )  # Debug print
+        print(f"CMake command: cmake {ext.sourcedir} {' '.join(cmake_args)}")
         subprocess.run(
             ["cmake", ext.sourcedir, *cmake_args],
             cwd=build_temp,
@@ -144,6 +147,7 @@ class CMakeBuild(build_ext):
         )
 
         print("-" * 10, "Building extension", "-" * 43)
+        print(f"Build command: cmake --build . {' '.join(build_args)}")
         subprocess.run(
             ["cmake", "--build", ".", *build_args],
             cwd=build_temp,
@@ -152,22 +156,41 @@ class CMakeBuild(build_ext):
         print("-" * 10, "Finished building extension", "-" * 36)
 
         # --- Copying (Fallback) ---
-        # Check if the file was created in the expected location by CMake
+        # This might not be needed anymore if CMAKE_LIBRARY_OUTPUT_DIRECTORY is correct,
+        # but keep it as a safety net.
         if not ext_fullpath.exists():
+            print(f"Extension not found at expected path: {ext_fullpath}")
+            print(f"Searching in build temp: {build_temp}")
             module_name = ext.name.split(".")[-1]
             found = False
-            # Search within the build temp directory
+            # Search within the build temp directory more thoroughly
             for suffix in (".so", ".dylib", ".pyd"):
-                candidates = list(build_temp.rglob(f"{module_name}*{suffix}"))
+                # Look for the pattern including potential config subdirs
+                candidates = list(build_temp.rglob(f"*{module_name}*{suffix}"))
                 if candidates:
-                    built = candidates[0]
-                    print(
-                        f"Copying built extension from build temp: {built} -> {ext_fullpath}"
-                    )
+                    built = candidates[0]  # Take the first match
+                    print(f"Found candidate in build temp: {built}")
+                    print(f"Copying built extension from: {built} -> {ext_fullpath}")
                     ext_fullpath.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(built, ext_fullpath)
                     found = True
                     break
+            if not found:
+                # Also check the original extdir just in case (for non-MSVC builds)
+                print(f"Searching in extdir: {extdir}")
+                for suffix in (".so", ".dylib", ".pyd"):
+                    candidates = list(extdir.rglob(f"{module_name}*{suffix}"))
+                    if candidates:
+                        built = candidates[0]
+                        print(f"Found candidate in extdir: {built}")
+                        print(
+                            f"Copying built extension from: {built} -> {ext_fullpath}"
+                        )
+                        ext_fullpath.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(built, ext_fullpath)
+                        found = True
+                        break
+
             if not found:
                 raise RuntimeError(
                     f"Could not find built extension {module_name}.* in {extdir} or {build_temp}"
