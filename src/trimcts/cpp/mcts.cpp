@@ -1,4 +1,4 @@
-
+// File: src/trimcts/cpp/mcts.cpp
 #include "mcts.h"
 #include "mcts_manager.h"     // Include the manager
 #include "python_interface.h" // For Python interaction
@@ -12,37 +12,104 @@
 #include <chrono>
 #include <utility> // For std::pair, std::move
 
-// Make sure pybind11 headers are included here if PYBIND11_EXPORT needs them
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h> // Include stl for pair conversion if needed
+#include <pybind11/stl.h>
 
 namespace trimcts
 {
 
   // --- Node Implementation ---
-  Node::Node(py::object state, Node *parent, Action action, float prior)
-      : parent_(parent), action_taken_(action), state_(std::move(state)), prior_probability_(prior) {}
+
+  // Constructor for non-root nodes
+  Node::Node(Node *parent, Action action, float prior)
+      : parent_(parent), action_taken_(action), prior_probability_(prior),
+        materialized_state_(std::nullopt), state_materialized_(false) {}
+
+  // Special method to set the state for the root node
+  void Node::set_root_state(py::object state)
+  {
+    materialized_state_ = std::move(state);
+    state_materialized_ = true;
+    parent_ = nullptr;  // Root has no parent
+    action_taken_ = -1; // No action led to root
+  }
+
+  // Get or materialize the state
+  py::object Node::get_state()
+  {
+    // If state is already materialized, return it
+    if (state_materialized_ && materialized_state_.has_value())
+    {
+      return *materialized_state_;
+    }
+
+    // If this is the root node but state wasn't set (error condition)
+    if (!parent_)
+    {
+      throw std::logic_error("Attempted to get_state for root node before state was set.");
+    }
+
+    // Materialize the state: Get parent's state, copy, apply action
+    // This is the potentially expensive part
+    // std::cout << "[DEBUG] Materializing state for node reached by action " << action_taken_ << std::endl; // Debug log
+    try
+    {
+      py::object parent_state = parent_->get_state(); // Recursive call
+      py::object my_state = trimcts::copy_state(parent_state);
+      trimcts::apply_action(my_state, action_taken_);
+
+      materialized_state_ = std::move(my_state);
+      state_materialized_ = true;
+      return *materialized_state_;
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "Error materializing state for node reached by action " << action_taken_ << ": " << e.what() << std::endl;
+      throw; // Re-throw exception
+    }
+    catch (const py::error_already_set &e)
+    {
+      std::cerr << "Python error materializing state for node reached by action " << action_taken_ << ": " << e.what() << std::endl;
+      throw; // Re-throw Python exception
+    }
+  }
+
+  bool Node::has_state_materialized() const
+  {
+    return state_materialized_;
+  }
+
+  Node *Node::get_parent() const
+  {
+    return parent_;
+  }
+  Action Node::get_action_taken() const
+  {
+    return action_taken_;
+  }
 
   bool Node::is_expanded() const { return !children_.empty(); }
-  bool Node::is_terminal() const { return trimcts::is_terminal(state_); }
+
+  // is_terminal now needs to potentially materialize the state
+  bool Node::is_terminal()
+  {
+    py::object state = get_state(); // Ensure state is available
+    return trimcts::is_terminal(state);
+  }
 
   float Node::get_value_estimate() const
   {
     if (visit_count_ == 0)
       return 0.0f;
-    // Avoid division by zero if visit_count_ somehow becomes zero after check (multithreading?)
-    // Though MCTS here is single-threaded, being safe doesn't hurt.
     return visit_count_ > 0 ? static_cast<float>(total_action_value_ / visit_count_) : 0.0f;
   }
 
   float Node::calculate_puct(const SearchConfig &config) const
   {
-    if (!parent_)                                    // Root node or detached node has no parent for PUCT calculation relative to parent
-      return std::numeric_limits<float>::infinity(); // Prioritize root selection initially.
+    if (!parent_)
+      return std::numeric_limits<float>::infinity();
 
-    // Standard PUCT calculation
     float q_value = get_value_estimate();
-    // Use std::max to avoid sqrt(0) if parent_visit_count is 0 (shouldn't happen after root expansion)
     double parent_visits_sqrt = std::sqrt(static_cast<double>(std::max(1, parent_->visit_count_)));
     double exploration_term = config.cpuct * prior_probability_ * (parent_visits_sqrt / (1.0 + visit_count_));
 
@@ -64,21 +131,21 @@ namespace trimcts
         best_child = child_ptr.get();
       }
     }
-    // Handle cases where no child is selected (e.g., all scores are -inf)
     if (best_child == nullptr && !children_.empty())
     {
-      // Fallback: return the first child? Or handle error?
-      // Returning nullptr seems safer, let caller handle.
       std::cerr << "Warning: select_child failed to find a best child despite having children." << std::endl;
     }
     return best_child;
   }
 
+  // Expansion no longer creates state, just child nodes
   void Node::expand(const PolicyMap &policy_map)
   {
-    if (is_expanded() || is_terminal())
+    if (is_expanded() || is_terminal()) // is_terminal() might materialize state here
       return;
-    std::vector<Action> valid_actions = trimcts::get_valid_actions(state_);
+
+    py::object current_state = get_state(); // Ensure state is available for get_valid_actions
+    std::vector<Action> valid_actions = trimcts::get_valid_actions(current_state);
     if (valid_actions.empty())
       return; // Cannot expand if no valid actions
 
@@ -88,30 +155,9 @@ namespace trimcts
       auto it = policy_map.find(action);
       if (it != policy_map.end())
         prior = it->second;
-      else
-      {
-        // Optionally handle actions valid in state but not in policy map
-        // prior = 1e-6f; // Example: Small prior
-        // std::cerr << "Warning: Action " << action << " valid in state but not in policy map." << std::endl;
-      }
 
-      // Eager state creation (copy + step)
-      try
-      {
-        py::object next_state_py = trimcts::copy_state(state_);
-        trimcts::apply_action(next_state_py, action);
-        children_[action] = std::make_unique<Node>(std::move(next_state_py), this, action, prior);
-      }
-      catch (const std::exception &e)
-      {
-        std::cerr << "Error during state copy/step in Node::expand for action " << action << ": " << e.what() << std::endl;
-        // Optionally skip this child or handle error differently
-      }
-      catch (const py::error_already_set &e)
-      {
-        std::cerr << "Python error during state copy/step in Node::expand for action " << action << ": " << e.what() << std::endl;
-        // Optionally skip this child or handle error differently
-      }
+      // Create child node without materializing its state yet
+      children_[action] = std::make_unique<Node>(this, action, prior);
     }
   }
 
@@ -126,31 +172,32 @@ namespace trimcts
     }
   }
 
-  // Detaches a child node, transferring ownership to the caller.
   std::unique_ptr<Node> Node::detach_child(Action action)
   {
     auto it = children_.find(action);
     if (it == children_.end())
     {
-      return nullptr; // Child not found
+      return nullptr;
     }
     std::unique_ptr<Node> child_ptr = std::move(it->second);
     children_.erase(it);
-    return child_ptr; // Transfer ownership
+    return child_ptr;
   }
 
   // Updates the Python state object held by this node.
+  // This is primarily used when reusing a node as the new root.
   void Node::update_state(py::object new_state)
   {
-    state_ = std::move(new_state); // py::object handles reference counting
+    materialized_state_ = std::move(new_state);
+    state_materialized_ = true; // Mark as materialized
   }
 
-  // Sets the parent pointer of this node.
   void Node::set_parent(Node *new_parent)
   {
     parent_ = new_parent;
   }
 
+  // sample_dirichlet_simple remains the same
   void sample_dirichlet_simple(double alpha, size_t k, std::vector<double> &output, std::mt19937 &rng)
   {
     output.resize(k);
@@ -159,7 +206,6 @@ namespace trimcts
     for (size_t i = 0; i < k; ++i)
     {
       output[i] = dist(rng);
-      // Clamp noise to avoid negative or extremely small values before normalization
       if (output[i] < 1e-9)
         output[i] = 1e-9;
       sum += output[i];
@@ -171,7 +217,6 @@ namespace trimcts
     }
     else
     {
-      // Avoid division by zero if sum is too small
       if (k > 0)
       {
         for (size_t i = 0; i < k; ++i)
@@ -191,7 +236,6 @@ namespace trimcts
     double total_prior = 0.0;
     for (auto &[action, child_ptr] : children_)
     {
-      // Ensure prior probability is valid before applying noise
       float current_prior = child_ptr->prior_probability_;
       if (!std::isfinite(current_prior))
       {
@@ -202,7 +246,6 @@ namespace trimcts
       total_prior += child_ptr->prior_probability_;
       i++;
     }
-    // Re-normalize priors after adding noise
     if (std::abs(total_prior - 1.0) > 1e-6 && total_prior > 1e-9)
     {
       for (auto &[action, child_ptr] : children_)
@@ -212,7 +255,6 @@ namespace trimcts
     }
     else if (total_prior <= 1e-9 && num_children > 0)
     {
-      // Handle case where all priors became zero (unlikely but possible)
       float uniform_prior = 1.0f / static_cast<float>(num_children);
       for (auto &[action, child_ptr] : children_)
       {
@@ -222,8 +264,9 @@ namespace trimcts
     }
   }
 
-  // --- MCTS Main Logic with Tree Reuse ---
+  // --- MCTS Main Logic with Lazy State Creation ---
 
+  // process_evaluated_batch needs to get state before expanding
   void process_evaluated_batch(
       const std::vector<Node *> &leaves,
       const std::vector<NetworkOutput> &results)
@@ -241,8 +284,9 @@ namespace trimcts
     {
       Node *leaf = leaves[i];
       const NetworkOutput &output = results[i];
+      // Expand *before* backpropagating value from evaluation
       if (!leaf->is_terminal())
-      {
+      { // is_terminal ensures state is materialized
         try
         {
           leaf->expand(output.policy);
@@ -250,26 +294,24 @@ namespace trimcts
         catch (const std::exception &e)
         {
           std::cerr << "Error during leaf expansion: " << e.what() << std::endl;
-          // Decide how to handle - maybe just backpropagate value?
         }
         catch (const py::error_already_set &e)
         {
           std::cerr << "Python error during leaf expansion: " << e.what() << std::endl;
         }
       }
-      // Backpropagate the value regardless of expansion success/failure
+      // Backpropagate the value from the network evaluation
       leaf->backpropagate(output.value);
     }
   }
 
-  // Main MCTS function updated for tree reuse
+  // Main MCTS function updated for tree reuse and lazy state
   PYBIND11_EXPORT std::pair<VisitMap, py::capsule> run_mcts_cpp_internal(
       py::object current_root_state_py,
       py::object network_interface_py,
       const SearchConfig &config,
-      const py::capsule &previous_tree_capsule, // Optional handle from previous step
-      Action last_action                        // Action that led to current_root_state_py
-  )
+      const py::capsule &previous_tree_capsule,
+      Action last_action)
   {
     std::unique_ptr<MctsTreeManager> tree_manager_ptr;
     Node *root_node = nullptr;
@@ -280,55 +322,44 @@ namespace trimcts
     {
       MctsTreeManager *previous_manager = static_cast<MctsTreeManager *>(
           PyCapsule_GetPointer(previous_tree_capsule.ptr(), "MctsTreeManager"));
-
       if (previous_manager)
       {
         Node *old_root = previous_manager->get_root();
-        // Check if old_root is valid and last_action makes sense
         if (old_root && last_action != -1)
         {
-          // Attempt to find and detach the child corresponding to the last action
           std::unique_ptr<Node> reused_subtree_root = old_root->detach_child(last_action);
-
           if (reused_subtree_root)
           {
-            // Successfully detached the child subtree
-            reused_subtree_root->set_parent(nullptr);                 // It's the new root
-            reused_subtree_root->update_state(current_root_state_py); // Update state reference
-
-            // Create a new manager owning the reused subtree
+            reused_subtree_root->set_parent(nullptr);
+            reused_subtree_root->update_state(current_root_state_py); // Set state for the new root
             tree_manager_ptr = std::make_unique<MctsTreeManager>(std::move(reused_subtree_root));
             root_node = tree_manager_ptr->get_root();
             reused_tree = true;
-            // std::cout << "[DEBUG] MCTS Tree Reused for action: " << last_action << std::endl;
-
-            // Note: The old manager (and the rest of the old tree) will be deleted
-            // when the previous_tree_capsule goes out of scope in Python and its
-            // destructor (capsule_destructor) is called.
           }
           else
           {
-            std::cerr << "Warning: Could not find child for last_action " << last_action << " in previous tree. Creating new tree." << std::endl;
+            std::cerr << "Warning: Could not find child for last_action " << last_action << ". Creating new tree." << std::endl;
           }
         }
         else
         {
-          std::cerr << "Warning: Previous tree handle provided, but old root or last_action invalid. Creating new tree." << std::endl;
+          std::cerr << "Warning: Previous tree handle invalid or last_action=-1. Creating new tree." << std::endl;
         }
       }
       else
       {
-        std::cerr << "Warning: Failed to retrieve MctsTreeManager pointer from capsule. Creating new tree." << std::endl;
+        std::cerr << "Warning: Failed to retrieve MctsTreeManager pointer. Creating new tree." << std::endl;
       }
     }
 
-    // --- Create New Tree if Reuse Failed or Not Requested ---
+    // --- Create New Tree if Reuse Failed ---
     if (!reused_tree)
     {
-      // std::cout << "[DEBUG] MCTS Creating New Tree." << std::endl;
       try
       {
-        auto initial_root = std::make_unique<Node>(current_root_state_py);
+        // Create root node without state initially
+        auto initial_root = std::make_unique<Node>(nullptr, -1, 1.0f); // Parent=null, action=-1, prior=1?
+        initial_root->set_root_state(current_root_state_py);           // Set its state
         tree_manager_ptr = std::make_unique<MctsTreeManager>(std::move(initial_root));
         root_node = tree_manager_ptr->get_root();
       }
@@ -344,43 +375,49 @@ namespace trimcts
       }
     }
 
-    // --- MCTS Core Logic (largely unchanged, operates on root_node) ---
+    // --- MCTS Core Logic ---
     if (!root_node || root_node->is_terminal())
-    {
-      // Return empty results and a null capsule if root is invalid or terminal
-      // If tree_manager_ptr exists, release it to the capsule so it gets deleted.
+    { // is_terminal ensures state is materialized
       MctsTreeManager *manager_to_delete = tree_manager_ptr ? tree_manager_ptr.release() : nullptr;
       return {{}, py::capsule(manager_to_delete, "MctsTreeManager", capsule_destructor)};
     }
 
     std::mt19937 rng(std::random_device{}());
 
-    // --- Root Preparation (Expansion/Noise) ---
-    // Expand if the node is not expanded. Add noise if it's expanded (either newly or reused).
+    // --- Root Preparation ---
     if (!root_node->is_expanded())
     {
       std::vector<Node *> root_batch_nodes = {root_node};
-      std::vector<py::object> root_batch_states = {root_node->state_};
+      // Get state for evaluation (materializes if needed)
+      std::vector<py::object> root_batch_states;
+      try
+      {
+        root_batch_states.push_back(root_node->get_state());
+      }
+      catch (...)
+      {
+        std::cerr << "Error getting root state for initial evaluation." << std::endl;
+        MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
+        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+      }
+
       std::vector<NetworkOutput> root_results;
       try
       {
         root_results = trimcts::evaluate_batch_alpha(network_interface_py, root_batch_states);
         if (root_results.empty())
-        {
           throw std::runtime_error("Root evaluation returned empty results.");
-        }
+
         if (!root_node->is_terminal())
-        {
-          root_node->expand(root_results[0].policy);
+        {                                            // Checks state again
+          root_node->expand(root_results[0].policy); // expand uses get_state internally
           if (!root_node->is_expanded())
           {
             std::cerr << "Warning: Root node failed to expand despite not being terminal." << std::endl;
-            // Return empty results, but keep the tree state
             MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
             return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
           }
         }
-        // Backpropagate the root's evaluated value *once* after initial eval/expansion
         root_node->backpropagate(root_results[0].value);
       }
       catch (const std::exception &e)
@@ -396,29 +433,28 @@ namespace trimcts
         return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
       }
     }
-    // Add noise if the root is now expanded (either newly or reused)
     if (root_node->is_expanded())
     {
       root_node->add_dirichlet_noise(config, rng);
     }
 
-    // --- Simulation Loop (Batching logic remains the same) ---
+    // --- Simulation Loop ---
     std::vector<Node *> all_leaves_to_evaluate;
-    all_leaves_to_evaluate.reserve(config.max_simulations); // Reserve based on sims
+    all_leaves_to_evaluate.reserve(config.max_simulations);
 
     for (uint32_t i = 0; i < config.max_simulations; ++i)
     {
-      Node *current_node = root_node; // Start from the potentially reused root
+      Node *current_node = root_node;
       int depth = 0;
 
       // 1. Selection
-      while (current_node->is_expanded() && !current_node->is_terminal())
+      while (current_node->is_expanded() && !current_node->is_terminal()) // is_terminal ensures state
       {
         Node *selected_child = current_node->select_child(config);
         if (!selected_child)
         {
-          std::cerr << "Warning: Selection failed to find a child for node with visit count " << current_node->visit_count_ << ". Stopping simulation." << std::endl;
-          current_node = nullptr; // Mark selection as failed
+          std::cerr << "Warning: Selection failed for node V=" << current_node->visit_count_ << ". Stopping sim." << std::endl;
+          current_node = nullptr;
           break;
         }
         current_node = selected_child;
@@ -428,20 +464,22 @@ namespace trimcts
       }
 
       if (!current_node)
-        continue; // Skip to next simulation if selection failed
+        continue;
 
-      // 2. Check if Expansion is Needed (or if terminal/max depth)
+      // 2. Expansion / Backpropagation
       if (!current_node->is_expanded() && !current_node->is_terminal() && depth < config.max_depth)
       {
+        // Leaf node needs evaluation. Add to list. State will be materialized later.
         all_leaves_to_evaluate.push_back(current_node);
       }
       else
       {
-        // Backpropagate terminal outcome or existing value estimate
-        Value value = current_node->is_terminal() ? trimcts::get_outcome(current_node->state_) : current_node->get_value_estimate();
+        // Node is terminal, already expanded, or max depth reached.
+        // Backpropagate terminal outcome or existing value estimate.
+        // Need state for get_outcome if terminal.
+        Value value = current_node->is_terminal() ? trimcts::get_outcome(current_node->get_state()) : current_node->get_value_estimate();
         current_node->backpropagate(value);
       }
-
     } // End simulation loop
 
     // --- Process ALL Collected Leaves in Batches ---
@@ -454,36 +492,49 @@ namespace trimcts
       {
         size_t batch_end = std::min(batch_start + batch_size, num_leaves);
         std::vector<Node *> current_batch_nodes;
-        std::vector<py::object> current_batch_states;
+        std::vector<py::object> current_batch_states; // States for the network
         current_batch_nodes.reserve(batch_end - batch_start);
         current_batch_states.reserve(batch_end - batch_start);
 
+        // Materialize states for the batch
+        bool state_error = false;
         for (size_t k = batch_start; k < batch_end; ++k)
         {
-          current_batch_nodes.push_back(all_leaves_to_evaluate[k]);
-          current_batch_states.push_back(all_leaves_to_evaluate[k]->state_);
+          Node *leaf = all_leaves_to_evaluate[k];
+          try
+          {
+            current_batch_states.push_back(leaf->get_state()); // Materialize state here
+            current_batch_nodes.push_back(leaf);
+          }
+          catch (...)
+          {
+            std::cerr << "Error getting state for leaf node during batch creation. Skipping node." << std::endl;
+            // Backpropagate 0 for this node?
+            leaf->backpropagate(0.0f);
+            state_error = true;
+          }
         }
+        // Skip network call if any state failed to materialize in this batch
+        if (state_error || current_batch_nodes.empty())
+          continue;
 
+        // Process this batch
         try
         {
           std::vector<NetworkOutput> results = trimcts::evaluate_batch_alpha(network_interface_py, current_batch_states);
-          process_evaluated_batch(current_batch_nodes, results);
+          process_evaluated_batch(current_batch_nodes, results); // Expands and backpropagates
         }
         catch (const std::exception &e)
         {
           std::cerr << "Error during MCTS batch evaluation/processing (Batch " << (batch_start / batch_size) << "): " << e.what() << std::endl;
           for (Node *leaf : current_batch_nodes)
-          {
-            leaf->backpropagate(0.0f); // Backpropagate neutral value on error
-          }
+            leaf->backpropagate(0.0f);
         }
         catch (const py::error_already_set &e)
         {
           std::cerr << "Python error during MCTS batch evaluation/processing (Batch " << (batch_start / batch_size) << "): " << e.what() << std::endl;
           for (Node *leaf : current_batch_nodes)
-          {
             leaf->backpropagate(0.0f);
-          }
         }
       }
     }
@@ -491,7 +542,7 @@ namespace trimcts
     // --- Collect Results ---
     VisitMap visit_counts;
     if (root_node)
-    { // Ensure root_node is valid before accessing children
+    {
       for (auto const &[action, child_ptr] : root_node->children_)
       {
         visit_counts[action] = child_ptr->visit_count_;
@@ -499,9 +550,7 @@ namespace trimcts
     }
 
     // --- Return results and the new tree handle ---
-    // Release ownership from unique_ptr to pass raw pointer to capsule
     MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
-    // Create the capsule with the pointer and the C destructor function
     py::capsule new_capsule(manager_raw_ptr, "MctsTreeManager", &capsule_destructor);
 
     return {visit_counts, new_capsule};

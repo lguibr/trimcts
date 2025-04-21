@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trimcts"
-version = "1.2.0" # Incremented version for tree reuse feature
+version = "1.2.1" # Incremented version for tree reuse feature
 authors = [
   { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
 ]
