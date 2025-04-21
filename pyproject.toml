@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trimcts"
-version = "1.0.4" # Increment version for the next release
+version = "1.0.5" # Increment version for the next release
 authors = [
   { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
 ]
