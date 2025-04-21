@@ -1,61 +1,54 @@
-# File: pyproject.toml
+name: CI
 
-[build-system]
-requires = [
-  "setuptools>=61.0",
-  "wheel",
-  "pybind11>=2.10",
-  "cmake>=3.14"
-]
-build-backend = "setuptools.build_meta"
+on:
+  push:
+    branches: [main]
+  pull_request:
 
-[project]
-name = "trimcts"
-version = "0.1.0"
-authors = [
-  { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
-]
-description = "High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games"
-readme = "README.md"
-license = "MIT" # Use SPDX identifier string
-requires-python = ">=3.10"
-classifiers = [
-  "Development Status :: 3 – Alpha",
-  "Intended Audience :: Developers",
-  # "License :: OSI Approved :: MIT License", # Removed deprecated classifier
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: C++",
-]
-dependencies = [
-  "numpy>=1.20.0",
-  "pydantic>=2.0.0",
-  "trianglengin>=1.0.6",
-]
+jobs:
+  build_test:
+    name: Build & Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.10', '3.11', '3.12']
 
-[project.urls]
-"Homepage"    = "https://github.com/lguibr/trimcts"
-"Bug Tracker" = "https://github.com/lguibr/trimcts/issues"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-[project.optional-dependencies]
-dev = ["pytest>=7.0","pytest-cov","ruff","mypy"]
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
 
-[tool.pytest.ini_options]
-addopts = "-ra -q --cov=src/trimcts --cov-report=term-missing"
-testpaths = ["tests"]
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install pybind11>=2.10 cmake
 
-[tool.mypy]
-# Global options
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-ignore_missing_imports = false # Be strict by default
-disallow_untyped_defs = true   # Ensure functions are typed
+      - name: Install package & dev deps
+        run: pip install -e .[dev]
 
-[[tool.mypy.overrides]]
-module = "trianglengin.*"
-ignore_missing_imports = true
+      - name: CMake configure (Windows only)
+        if: runner.os == 'Windows'
+        run: cmake -S src/trimcts/cpp -B build -A x64
 
-[[tool.mypy.overrides]]
-# Ignore the compiled C++ extension module
-module = "trimcts.trimcts_cpp"
-ignore_missing_imports = true
+      - name: Build C++ extension
+        run: python setup.py build_ext --inplace
+
+      - name: Run tests with coverage
+        run: pytest --cov=src/trimcts --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4.0.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}    # add this secret in your repo
+          files: coverage.xml
+          fail_ci_if_error: true
