@@ -1,3 +1,5 @@
+# File: setup.py
+
 import os
 import re
 import shutil
@@ -6,6 +8,8 @@ import sys
 import sysconfig
 from pathlib import Path
 
+# Import pybind11 BEFORE setuptools
+import pybind11
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.develop import develop as _develop
@@ -74,6 +78,14 @@ class CMakeBuild(build_ext):
                         python_library_file = str(candidate.resolve())
                         break
 
+        # Get Pybind11 CMake directory
+        pybind11_cmake_dir = pybind11.get_cmake_dir()
+        if not Path(pybind11_cmake_dir).exists():
+            raise RuntimeError(
+                f"Could not find Pybind11 CMake directory: {pybind11_cmake_dir}"
+            )
+        print(f"Found Pybind11 CMake directory: {pybind11_cmake_dir}")
+
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DPython_EXECUTABLE={python_executable}",
@@ -81,8 +93,11 @@ class CMakeBuild(build_ext):
             # Only pass Python_LIBRARIES if we found the specific file
             f"-DPython_LIBRARIES={python_library_file}" if python_library_file else "",
             f"-DCMAKE_BUILD_TYPE={cfg}",
+            # Pass Pybind11 CMake directory hint
+            f"-Dpybind11_DIR={pybind11_cmake_dir}",
+            # These might not be strictly necessary if pybind11_DIR is set, but keep for robustness
             "-Dpybind11_FINDPYTHON=ON",
-            "-DPython_FIND_STRATEGY=LOCATION",  # Prioritize using the executable location
+            "-DPython_FIND_STRATEGY=LOCATION",
         ]
         # Filter out empty strings from cmake_args (like potentially empty Python_LIBRARIES)
         cmake_args = [arg for arg in cmake_args if arg]

@@ -11,18 +11,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trimcts"
-version = "0.1.1"
+version = "0.1.0"
 authors = [
   { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
 ]
 description = "High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games"
 readme = "README.md"
-license = { file="LICENSE" }
+license = "MIT" # Use SPDX identifier string
 requires-python = ">=3.10"
 classifiers = [
   "Development Status :: 3 – Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
+  # "License :: OSI Approved :: MIT License", # Removed deprecated classifier
   "Programming Language :: Python :: 3.10",
   "Programming Language :: C++",
 ]
