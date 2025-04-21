@@ -1,14 +1,18 @@
+# File: .github/workflows/ci_cd.yml
 name: TRIMCTS_CI_CD
 
 on:
   push:
     branches: [main]
+    tags:
+      - 'v*.*.*' # Trigger on version tags like v1.0.0
   pull_request:
+    branches: [main] # Run on PRs targeting main
 
 jobs:
   lint_and_type_check:
     name: Lint & Type Check (Python 3.12)
-    runs-on: ubuntu-latest # Run on the fastest/cheapest runner for static checks
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -18,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
-          cache-dependency-path: 'pyproject.toml' # Cache based on pyproject.toml
+          cache-dependency-path: 'pyproject.toml'
 
       - name: Install Linters
         run: pip install ruff mypy
@@ -30,9 +34,6 @@ jobs:
         run: ruff check .
 
       - name: Run MyPy
-        # Install core dependencies needed for MyPy to understand imports,
-        # including pytest for the tests directory.
-        # MyPy config should handle ignoring missing imports for others.
         run: |
           pip install numpy pydantic typing-extensions pytest
           mypy src tests
@@ -40,32 +41,23 @@ jobs:
   build_wheels:
     name: Build Wheel (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    needs: lint_and_type_check # Optional: Only build if linting passes
+    needs: lint_and_type_check
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ['3.10', '3.11', '3.12']
-        # Add architecture if needed, e.g., for macOS ARM vs Intel
-        # include:
-        #   - os: macos-latest
-        #     python-version: '3.10'
-        #     architecture: x64
-        #   - os: macos-latest
-        #     python-version: '3.10'
-        #     architecture: arm64
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          submodules: recursive # Ensure submodules are checked out if needed for build
+          submodules: recursive
 
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          # architecture: ${{ matrix.architecture }} # Uncomment if using architecture matrix
 
       - name: Install build tools
         run: |
@@ -73,32 +65,24 @@ jobs:
           pip install pybind11>=2.10 cmake
 
       - name: Build wheel
-        # Build wheel, place it in dist/, --no-deps ensures dependencies aren't bundled
         run: pip wheel . --wheel-dir dist/ --no-deps
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}-${{ matrix.python-version }} # Unique name per matrix entry
-          path: dist/*.whl # Upload the built wheel file(s)
+          # Use a consistent name pattern for easy download later
+          name: python-wheels-${{ matrix.os }}-${{ matrix.python-version }}
+          path: dist/*.whl
 
   test:
     name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    needs: build_wheels # Ensure wheels are built before testing
+    needs: build_wheels
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ['3.10', '3.11', '3.12']
-        # Add architecture if needed, matching the build_wheels matrix
-        # include:
-        #   - os: macos-latest
-        #     python-version: '3.10'
-        #     architecture: x64
-        #   - os: macos-latest
-        #     python-version: '3.10'
-        #     architecture: arm64
 
     steps:
       - name: Checkout code # Needed for test files
@@ -108,21 +92,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          # architecture: ${{ matrix.architecture }} # Uncomment if using architecture matrix
           cache: 'pip'
           cache-dependency-path: 'pyproject.toml'
 
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}-${{ matrix.python-version }}
-          path: dist # Download to dist/ directory
+          # Match the upload name pattern
+          name: python-wheels-${{ matrix.os }}-${{ matrix.python-version }}
+          path: dist
 
       - name: Install package from wheel and test dependencies
         run: |
-          # Install the specific wheel built for this platform
           pip install dist/*.whl
-          # Install dev dependencies (includes test tools and runtime deps via extras)
           pip install .[dev]
 
       - name: Run tests with coverage
@@ -137,30 +119,56 @@ jobs:
   upload_coverage:
     name: Upload Coverage to Codecov
     runs-on: ubuntu-latest
-    needs: test # Run after all test jobs complete
-    if: github.repository == 'lguibr/trimcts' && (github.event_name == 'push' || github.event_name == 'pull_request') # Only run on main repo pushes/PRs
+    needs: test
+    # Run on main repo pushes/PRs, but not necessarily only on tags
+    if: github.repository == 'lguibr/trimcts' && (github.event_name == 'push' || github.event_name == 'pull_request')
 
     steps:
-      - name: Checkout code (optional, needed by codecov action sometimes)
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download all coverage artifacts
         uses: actions/download-artifact@v4
         with:
-          # Use a pattern to download all coverage files if action supports it,
-          # otherwise download them individually or download all artifacts and filter.
-          # For simplicity, let's download all artifacts to a known location.
-          path: artifacts # Download all artifacts into 'artifacts' directory
+          path: artifacts/coverage
+          pattern: coverage-* # Download only coverage artifacts
+          merge-multiple: true # Merge artifacts with same name from different jobs
 
       - name: List downloaded artifacts (for debugging)
         run: ls -R artifacts
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4 # v4 should handle merging automatically
+        uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          # Point the action to the directory containing all coverage reports
-          # Adjust the directory structure if needed based on download artifact behavior
-          directory: artifacts/ # Tell action to search this directory
+          # Point to the directory where coverage files were downloaded
+          directory: artifacts/coverage/
           fail_ci_if_error: true
-          verbose: true # Enable verbose logging for debugging
+          verbose: true
+
+  publish_to_pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: test # Ensure all tests passed on all platforms
+    # Only run when a version tag is pushed to the main branch
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'lguibr/trimcts'
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist # Download all artifacts into dist/
+          # Use pattern matching to get all wheel artifacts
+          pattern: python-wheels-*
+          merge-multiple: true # Combine artifacts from different jobs into one directory
+
+      - name: List downloaded wheels (for debugging)
+        run: ls -R dist
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Use an API token for authentication
+          # Store this token as a secret named PYPI_API_TOKEN in your repository settings
+          token: ${{ secrets.PYPI_API_TOKEN }}
+          # The action will automatically upload all wheels and sdist found in dist/
