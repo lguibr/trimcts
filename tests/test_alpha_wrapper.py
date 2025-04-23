@@ -1,3 +1,4 @@
+# File: trimcts/tests/test_alpha_wrapper.py
 # File: tests/test_alpha_wrapper.py
 import time
 from typing import Any, TypeAlias  # Import TypeAlias
@@ -201,11 +202,12 @@ def test_mcts_run_alpha_basic(
     duration = time.time() - start_time
     print(f"--- MCTS Run Finished ({duration:.4f}s) ---")
 
-    assert isinstance(result_tuple, tuple) and len(result_tuple) == 2
-    visit_counts, tree_handle = result_tuple
+    assert isinstance(result_tuple, tuple) and len(result_tuple) == 3
+    visit_counts, tree_handle, avg_depth = result_tuple
 
     print(f"Visit Counts: {visit_counts}")
     print(f"Tree Handle: {'Present' if tree_handle else 'None'}")
+    print(f"Average Depth: {avg_depth:.2f}")
     print(f"Network single evals (evaluate_state calls): {dummy_network.eval_count}")
     print(
         f"Network batch evals (evaluate_batch calls): {dummy_network.batch_eval_count}"
@@ -214,6 +216,8 @@ def test_mcts_run_alpha_basic(
 
     assert isinstance(visit_counts, dict)
     assert tree_handle is not None  # Should get a handle even on first run
+    assert isinstance(avg_depth, float)
+    assert avg_depth >= 0.0
 
     valid_root_actions = set(dummy_state.valid_actions())
     if valid_root_actions:
@@ -235,7 +239,7 @@ def test_mcts_run_on_terminal_state(
     dummy_network: DummyAlphaNetwork,
     search_config: SearchConfiguration,
 ) -> None:
-    """Test MCTS run starting from a terminal state (should return empty, None handle)."""
+    """Test MCTS run starting from a terminal state (should return empty, None handle, 0 depth)."""
     steps = 0
     max_steps = 100
     while not dummy_state.is_over() and steps < max_steps:
@@ -266,15 +270,17 @@ def test_mcts_run_on_terminal_state(
 
     print("\n--- Starting MCTS Run on Terminal State ---")
     result_tuple = run_mcts(dummy_state, dummy_network, search_config)
-    assert isinstance(result_tuple, tuple) and len(result_tuple) == 2
-    visit_counts, tree_handle = result_tuple
+    assert isinstance(result_tuple, tuple) and len(result_tuple) == 3
+    visit_counts, tree_handle, avg_depth = result_tuple
 
     print(f"Visit Counts: {visit_counts}")
     print(f"Tree Handle: {'Present' if tree_handle else 'None'}")
+    print(f"Average Depth: {avg_depth:.2f}")
 
     assert isinstance(visit_counts, dict)
     assert len(visit_counts) == 0
     assert tree_handle is None  # Expect None handle for terminal state
+    assert avg_depth == 0.0  # Expect 0 depth for terminal state
     assert dummy_network.total_states_evaluated == 0
     assert dummy_network.batch_eval_count == 0
 
@@ -292,10 +298,11 @@ def test_mcts_tree_reuse_api_call(
     print("\n--- Tree Reuse Test: First Call ---")
     search_config.max_simulations = 5
     search_config.dirichlet_alpha = 0.0
-    vc1, h1 = run_mcts(dummy_state, dummy_network, search_config)
-    print(f"VC1: {vc1}, Handle1: {'Present' if h1 else 'None'}")
+    vc1, h1, ad1 = run_mcts(dummy_state, dummy_network, search_config)
+    print(f"VC1: {vc1}, Handle1: {'Present' if h1 else 'None'}, AvgDepth1: {ad1:.2f}")
     assert isinstance(vc1, dict)
     assert h1 is not None
+    assert isinstance(ad1, float) and ad1 >= 0.0
 
     # 2. Simulate taking an action
     if not vc1:
@@ -311,16 +318,17 @@ def test_mcts_tree_reuse_api_call(
     # 3. Second call (with reuse)
     print("\n--- Tree Reuse Test: Second Call ---")
     dummy_network.reset_counters()  # Reset counters to see effect of reuse
-    vc2, h2 = run_mcts(
+    vc2, h2, ad2 = run_mcts(
         dummy_state,
         dummy_network,
         search_config,
         previous_tree_handle=h1,  # Pass previous handle
         last_action=last_action,  # Pass action taken
     )
-    print(f"VC2: {vc2}, Handle2: {'Present' if h2 else 'None'}")
+    print(f"VC2: {vc2}, Handle2: {'Present' if h2 else 'None'}, AvgDepth2: {ad2:.2f}")
     assert isinstance(vc2, dict)
     assert h2 is not None
+    assert isinstance(ad2, float) and ad2 >= 0.0
     # Note: Comparing capsule objects directly for non-equality might not be reliable.
     # The underlying pointer should be different if reuse happened correctly,
     # but we can't easily check that from Python without unsafe access.

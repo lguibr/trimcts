@@ -7,6 +7,7 @@
 #include <random>
 #include <optional> // For optional members/return
 #include <utility>  // For std::pair
+#include <tuple>    // For std::tuple
 
 #include "config.h"
 #include "python_interface.h" // For types and Python interaction helpers
@@ -75,8 +76,8 @@ namespace trimcts
     float calculate_puct(const SearchConfig &config) const;
   };
 
-  // Main MCTS function signature remains the same
-  PYBIND11_EXPORT std::pair<VisitMap, py::capsule> run_mcts_cpp_internal(
+  // Main MCTS function signature updated to return average depth
+  PYBIND11_EXPORT std::tuple<VisitMap, py::capsule, double> run_mcts_cpp_internal(
       py::object current_root_state_py,
       py::object network_interface_py,
       const SearchConfig &config,

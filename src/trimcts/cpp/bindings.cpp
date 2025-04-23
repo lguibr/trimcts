@@ -1,3 +1,4 @@
+// File: trimcts/src/trimcts/cpp/bindings.cpp
 // File: src/trimcts/cpp/bindings.cpp
 
 #include <pybind11/pybind11.h>
@@ -12,6 +13,7 @@
 #include <string>    // std::string
 #include <stdexcept> // std::runtime_error
 #include <utility>   // For std::pair
+#include <tuple>     // For std::tuple
 
 namespace py = pybind11;
 namespace tc = trimcts; // Alias for your C++ namespace
@@ -44,8 +46,8 @@ static tc::SearchConfig python_to_cpp_config(const py::object &py_config)
 }
 
 // Wrapper function exposed to Python - updated for tree reuse
-// Returns a pair (VisitMap, new_capsule)
-std::pair<tc::VisitMap, py::capsule> run_mcts_cpp_wrapper(
+// Returns a tuple (VisitMap, new_capsule, avg_depth)
+std::tuple<tc::VisitMap, py::capsule, double> run_mcts_cpp_wrapper(
     py::object root_state_py,
     py::object network_interface_py,
     const py::object &config_py,
@@ -122,9 +124,10 @@ PYBIND11_MODULE(trimcts_cpp, m)
                 A tuple containing:
                     - VisitMap (dict[int, int]): Visit counts for actions from the root.
                     - py::capsule: A new handle to the MCTS tree state after the search. None if MCTS failed or state was terminal.
+                    - float: The average depth reached across all simulations performed.
         )pbdoc",
         // Ensure return value policy allows Python to manage the capsule lifetime
-        py::return_value_policy::move); // Move the pair, including the capsule
+        py::return_value_policy::move); // Move the tuple, including the capsule
 
 #ifdef VERSION_INFO
   m.attr("__version__") = VERSION_INFO;

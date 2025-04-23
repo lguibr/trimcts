@@ -1,3 +1,4 @@
+# File: trimcts/pyproject.toml
 
 [build-system]
 requires = [
@@ -10,11 +11,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trimcts"
-version = "1.2.1" # Incremented version for tree reuse feature
+version = "1.3.0" # Incremented version for avg depth feature
 authors = [
   { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
 ]
-description = "High‑performance C++ MCTS (AlphaZero & MuZero) with Tree Reuse for triangular games" # Updated description
+description = "High‑performance C++ MCTS (AlphaZero & MuZero) with Tree Reuse and Avg Depth for triangular games" # Updated description
 readme = "README.md"
 license = "MIT" # Use SPDX identifier string
 requires-python = ">=3.10"

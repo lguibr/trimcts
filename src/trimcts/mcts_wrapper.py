@@ -1,3 +1,4 @@
+# File: trimcts/src/trimcts/mcts_wrapper.py
 import logging
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -44,7 +45,7 @@ def run_mcts(
     config: SearchConfiguration,
     previous_tree_handle: MctsTreeHandle | None = None,
     last_action: int = -1,
-) -> tuple[dict[int, int], MctsTreeHandle | None]:
+) -> tuple[dict[int, int], MctsTreeHandle | None, float]:
     """
     Python entry point for running MCTS, supporting tree reuse.
 
@@ -59,14 +60,15 @@ def run_mcts(
         A tuple containing:
             - Visit counts (dict[int, int]) for actions from the root.
             - An opaque handle to the MCTS tree state after the search (or None if MCTS failed).
-            Returns ({}, None) immediately if root_state.is_over() is True.
+            - The average depth reached across all simulations performed (float).
+            Returns ({}, None, 0.0) immediately if root_state.is_over() is True.
     """
     # Terminal-state shortcut
     if not hasattr(root_state, "is_over") or not callable(root_state.is_over):
         raise TypeError("root_state object missing required method: is_over")
     if root_state.is_over():
         logger.warning("run_mcts called on a terminal state. Returning empty.")
-        return {}, None
+        return {}, None, 0.0
 
     # Validate config
     if not isinstance(config, SearchConfiguration):
@@ -123,7 +125,7 @@ def run_mcts(
             "MuZero MCTS integration is not yet implemented in C++ bindings."
         )
 
-    # Call into C++ - it now returns a tuple (visit_map, new_handle)
+    # Call into C++ - it now returns a tuple (visit_map, new_handle, avg_depth)
     try:
         # Pass None directly if previous_tree_handle is None
         handle_to_pass = (
@@ -138,16 +140,16 @@ def run_mcts(
         )
     except Exception as cpp_err:
         logger.error(f"Error during C++ MCTS execution: {cpp_err}", exc_info=True)
-        return {}, None  # Return empty on C++ error
+        return {}, None, 0.0  # Return empty on C++ error
 
     # Validate and unpack the returned tuple
-    if not isinstance(result_tuple, tuple) or len(result_tuple) != 2:
+    if not isinstance(result_tuple, tuple) or len(result_tuple) != 3:
         logger.error(
             f"C++ MCTS returned unexpected type or length: {type(result_tuple)}"
         )
-        return {}, None
+        return {}, None, 0.0
 
-    visit_counts_raw, new_tree_handle = result_tuple
+    visit_counts_raw, new_tree_handle, avg_depth_raw = result_tuple
 
     # Validate visit counts
     validated_visit_counts: dict[int, int] = {}  # Use a different name here
@@ -166,11 +168,20 @@ def run_mcts(
                     f"Skipping invalid result entry: ({k!r}:{type(k)}, {v!r}:{type(v)})"
                 )
 
+    # Validate average depth
+    avg_depth: float = 0.0
+    if isinstance(avg_depth_raw, float | int):
+        avg_depth = float(avg_depth_raw)
+    else:
+        logger.error(
+            f"C++ MCTS returned unexpected type for average depth: {type(avg_depth_raw)}"
+        )
+
     # The handle can be None if C++ returns a null capsule (e.g., on error or terminal state)
     # Check if the returned handle is None (Python None, not a null capsule object)
     if new_tree_handle is None:
         logger.debug("C++ MCTS returned None for the tree handle.")
-        return validated_visit_counts, None
+        return validated_visit_counts, None, avg_depth
 
     # If it's not None, assume it's a valid capsule handle
-    return validated_visit_counts, new_tree_handle
+    return validated_visit_counts, new_tree_handle, avg_depth

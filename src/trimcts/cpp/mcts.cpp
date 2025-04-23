@@ -1,4 +1,4 @@
-// File: src/trimcts/cpp/mcts.cpp
+// File: trimcts/src/trimcts/cpp/mcts.cpp
 #include "mcts.h"
 #include "mcts_manager.h"     // Include the manager
 #include "python_interface.h" // For Python interaction
@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <utility> // For std::pair, std::move
+#include <tuple>   // For std::tuple return type
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -306,7 +307,8 @@ namespace trimcts
   }
 
   // Main MCTS function updated for tree reuse and lazy state
-  PYBIND11_EXPORT std::pair<VisitMap, py::capsule> run_mcts_cpp_internal(
+  // Returns tuple: (VisitMap, capsule_handle, avg_depth)
+  PYBIND11_EXPORT std::tuple<VisitMap, py::capsule, double> run_mcts_cpp_internal(
       py::object current_root_state_py,
       py::object network_interface_py,
       const SearchConfig &config,
@@ -366,12 +368,12 @@ namespace trimcts
       catch (const std::exception &e)
       {
         std::cerr << "Error creating initial root node: " << e.what() << std::endl;
-        return {{}, py::capsule(nullptr, "MctsTreeManager", capsule_destructor)};
+        return {{}, py::capsule(nullptr, "MctsTreeManager", capsule_destructor), 0.0};
       }
       catch (const py::error_already_set &e)
       {
         std::cerr << "Python error creating initial root node: " << e.what() << std::endl;
-        return {{}, py::capsule(nullptr, "MctsTreeManager", capsule_destructor)};
+        return {{}, py::capsule(nullptr, "MctsTreeManager", capsule_destructor), 0.0};
       }
     }
 
@@ -379,7 +381,7 @@ namespace trimcts
     if (!root_node || root_node->is_terminal())
     { // is_terminal ensures state is materialized
       MctsTreeManager *manager_to_delete = tree_manager_ptr ? tree_manager_ptr.release() : nullptr;
-      return {{}, py::capsule(manager_to_delete, "MctsTreeManager", capsule_destructor)};
+      return {{}, py::capsule(manager_to_delete, "MctsTreeManager", capsule_destructor), 0.0};
     }
 
     std::mt19937 rng(std::random_device{}());
@@ -398,7 +400,7 @@ namespace trimcts
       {
         std::cerr << "Error getting root state for initial evaluation." << std::endl;
         MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
-        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor), 0.0};
       }
 
       std::vector<NetworkOutput> root_results;
@@ -415,7 +417,7 @@ namespace trimcts
           {
             std::cerr << "Warning: Root node failed to expand despite not being terminal." << std::endl;
             MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
-            return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+            return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor), 0.0};
           }
         }
         root_node->backpropagate(root_results[0].value);
@@ -424,13 +426,13 @@ namespace trimcts
       {
         std::cerr << "Error during MCTS root preparation: " << e.what() << std::endl;
         MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
-        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor), 0.0};
       }
       catch (const py::error_already_set &e)
       {
         std::cerr << "Python error during MCTS root preparation: " << e.what() << std::endl;
         MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
-        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor), 0.0};
       }
     }
     if (root_node->is_expanded())
@@ -441,11 +443,14 @@ namespace trimcts
     // --- Simulation Loop ---
     std::vector<Node *> all_leaves_to_evaluate;
     all_leaves_to_evaluate.reserve(config.max_simulations);
+    uint64_t total_depth_sum = 0;        // Track sum of depths reached
+    uint32_t actual_simulations_run = 0; // Track number of sims completed
 
     for (uint32_t i = 0; i < config.max_simulations; ++i)
     {
       Node *current_node = root_node;
       int depth = 0;
+      bool simulation_completed = false;
 
       // 1. Selection
       while (current_node->is_expanded() && !current_node->is_terminal()) // is_terminal ensures state
@@ -471,6 +476,8 @@ namespace trimcts
       {
         // Leaf node needs evaluation. Add to list. State will be materialized later.
         all_leaves_to_evaluate.push_back(current_node);
+        // We will backpropagate after evaluation
+        simulation_completed = true; // Mark sim as reaching a point for backprop
       }
       else
       {
@@ -479,7 +486,16 @@ namespace trimcts
         // Need state for get_outcome if terminal.
         Value value = current_node->is_terminal() ? trimcts::get_outcome(current_node->get_state()) : current_node->get_value_estimate();
         current_node->backpropagate(value);
+        simulation_completed = true; // Mark sim as reaching a point for backprop
       }
+
+      // Track depth if simulation completed a path
+      if (simulation_completed)
+      {
+        total_depth_sum += depth;
+        actual_simulations_run++;
+      }
+
     } // End simulation loop
 
     // --- Process ALL Collected Leaves in Batches ---
@@ -549,11 +565,16 @@ namespace trimcts
       }
     }
 
+    // --- Calculate Average Depth ---
+    double average_depth = (actual_simulations_run > 0)
+                               ? static_cast<double>(total_depth_sum) / actual_simulations_run
+                               : 0.0;
+
     // --- Return results and the new tree handle ---
     MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
     py::capsule new_capsule(manager_raw_ptr, "MctsTreeManager", &capsule_destructor);
 
-    return {visit_counts, new_capsule};
+    return std::make_tuple(visit_counts, new_capsule, average_depth);
   }
 
 } // namespace trimcts

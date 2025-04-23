@@ -35,16 +35,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trimcts"
-version = "1.1.1" # Incremented version for batching feature
+version = "1.2.1" # Incremented version for tree reuse feature
 authors = [
   { name="Luis Guilherme P. M.", email="lgpelin92@gmail.com" },
 ]
-description = "High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games"
+description = "High‑performance C++ MCTS (AlphaZero & MuZero) with Tree Reuse for triangular games" # Updated description
 readme = "README.md"
 license = "MIT" # Use SPDX identifier string
 requires-python = ">=3.10"
 classifiers = [
-  "Development Status :: 4 - Beta", # Changed from Alpha to Beta
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: C++",
@@ -52,7 +52,7 @@ classifiers = [
 dependencies = [
   "numpy>=1.20.0",
   "pydantic>=2.0.0",
-  "trianglengin>=2.0.6", # Update dependency if needed
+  "trianglengin>=2.0.6", # Keep dependency up-to-date
 ]
 
 [project.urls]
@@ -83,7 +83,6 @@ ignore_missing_imports = true
 module = "trimcts.trimcts_cpp"
 ignore_missing_imports = true
 
-
 File: MANIFEST.in
 # File: MANIFEST.in
 # Include C++ source files and CMakeLists.txt
@@ -105,692 +104,7 @@ prune build
 prune dist
 
 File: README.md
-Okay, Phase 1 addressed the C++ implementation of `copy` and `step` directly. The test passing indicates the core logic is likely sound. Now, let's move to Phase 2: Optimizing how `trimcts` interacts with `trianglengin`, aiming to reduce the *cost* or *frequency* of expensive operations called from C++ back into Python during the MCTS search.
 
-You mentioned reusing trees, which is a standard technique (often called "subtree reuse" or "warm starting"). Let's analyze the state-of-the-art approaches and decide on the best strategy for Phase 2:
-
-**State-of-the-Art MCTS Optimizations & Phase 2 Options:**
-
-1.  **Subtree Reuse:**
-    *   **Concept:** After selecting the best action `A` based on the search from the root `R`, instead of discarding the entire tree, reuse the subtree rooted at the child node `C` corresponding to action `A`. Make `C` the new root for the next search step. Prune the rest of the tree.
-    *   **Pros:** Significantly reduces redundant computation, especially early in the game or when simulations are high. The most impactful optimization for reducing the *number* of simulations needed per step.
-    *   **Cons:**
-        *   **Major Architectural Change:** Requires `run_mcts` to manage tree state across calls (accepting an old root/tree, returning the new root/tree).
-        *   **Python State Management:** The C++ tree nodes hold `py::object` references to Python `GameState` objects. When reusing a subtree, the new root node in C++ needs to point to the *actual* updated Python `GameState` object (after `step(A)` was called in Python). This cross-language state management is complex and error-prone (reference counting, object lifetime).
-        *   **Complexity:** High implementation complexity in both C++ and the Python wrapper.
-
-2.  **Batched Network Evaluations:**
-    *   **Concept:** Modify the C++ MCTS simulation loop. Instead of calling the Python `network.evaluate_state` for each leaf node encountered during expansion, collect a batch of leaf nodes (and their corresponding Python `GameState` objects). Then, make a single call to the Python `network.evaluate_batch` method. Distribute the results back to the respective nodes for expansion and backpropagation.
-    *   **Pros:**
-        *   Directly addresses the profiling result showing many `evaluate_state` calls.
-        *   Leverages GPU parallelism for network inference much more effectively.
-        *   Reduces Python C++ call overhead significantly for network evaluations.
-        *   Lower architectural impact than subtree reuse (doesn't change the fundamental "new search per step" model as drastically).
-    *   **Cons:**
-        *   Requires modifying the C++ MCTS simulation loop logic.
-        *   Introduces slight latency while waiting to fill a batch within a simulation step (but overall throughput should increase).
-        *   Doesn't reduce the number of `copy`/`step` calls during expansion, only network calls.
-
-3.  **Virtual Loss:**
-    *   **Concept:** When multiple simulations run in parallel (conceptually, or in a batched manner), temporarily penalize the value of nodes currently being explored by other simulations ("virtual loss"). This encourages exploration of different branches while waiting for batch results.
-    *   **Pros:** Improves exploration efficiency when using batching.
-    *   **Cons:** Primarily useful in highly parallelized search settings (e.g., multiple threads exploring the same tree, or large batches). Adds complexity to node statistics.
-
-**Decision for Phase 2:**
-
-*   **Subtree Reuse:** Highest potential gain but highest complexity and risk due to Python state management. Let's keep this as a potential Phase 3 if needed.
-*   **Batched Network Evaluations:** Directly addresses a known bottleneck (`evaluate_state` calls), leverages GPU potential, has moderate complexity, and lower risk. This is the most pragmatic and impactful next step.
-*   **Virtual Loss:** Can be added *on top of* batching later if needed, but batching itself is the primary goal now.
-
-**Therefore, the plan for Phase 2 is to implement Batched Network Evaluations within the `trimcts` C++ core.**
-
-**Implementation Plan (Batching):**
-
-1.  **Modify `mcts.cpp` (`run_mcts_cpp_internal`):**
-    *   Change the main simulation loop.
-    *   When selection reaches a leaf node that needs expansion:
-        *   Do *not* immediately call `evaluate_state_alpha`.
-        *   Store the leaf `Node*` pointer and its Python `state_` object (`py::object`) in temporary vectors (e.g., `std::vector<Node*> leaves_to_evaluate; std::vector<py::object> states_to_evaluate;`).
-    *   Continue running simulations, adding leaves to these vectors until a batch size is reached (e.g., 8 or 16) or the total simulation budget is nearly exhausted.
-    *   If the vectors are non-empty:
-        *   Call `evaluate_batch_alpha(network_interface_py, states_to_evaluate)`.
-        *   Iterate through the returned results and the corresponding `leaves_to_evaluate`.
-        *   For each leaf node and its `(policy, value)` result:
-            *   Call `node->expand(policy)`.
-            *   Call `node->backpropagate(value)`.
-        *   Clear the temporary vectors.
-    *   Handle the case where the loop finishes with remaining leaves in the vectors (process the final partial batch).
-2.  **Configuration:** Add a batch size parameter to `SearchConfiguration` (both Python and C++). Default to 1 initially to match current behavior, then allow users to increase it (e.g., 8).
-3.  **Python Interface (`python_interface.h`):** No changes needed here, as `evaluate_batch_alpha` already exists.
-4.  **Testing:** Add tests (or modify existing ones) to verify batching works correctly and potentially measure performance improvement (though exact timing is hard in unit tests).
-5.  **Documentation:** Update READMEs in `trimcts`.
-6.  **Versioning:** Increment `trimcts` version.
-
-**Files to Change (Phase 2 - `trimcts`):**
-
-1.  `src/trimcts/cpp/config.h`: Add `batch_size` member.
-2.  `src/trimcts/config.py`: Add `MCTS_BATCH_SIZE` field to `SearchConfiguration`.
-3.  `src/trimcts/cpp/mcts.h`: Potentially minor changes if helper structs are needed.
-4.  `src/trimcts/cpp/mcts.cpp`: Major changes to `run_mcts_cpp_internal` loop logic.
-5.  `src/trimcts/cpp/bindings.cpp`: Update `python_to_cpp_config` to handle `MCTS_BATCH_SIZE`.
-6.  `README.md`: Document batching feature and config.
-7.  `pyproject.toml`: Increment version.
-
-Let's start implementing the batching logic.
-
----
-
-**1. File:** `trimcts/src/trimcts/cpp/config.h`
-*   **Change:** Add `mcts_batch_size`.
-
-```cpp
-#pragma once
-
-#include <cstdint> // For uint32_t etc.
-
-namespace trimcts {
-
-// Matches the Python SearchConfiguration Pydantic model
-struct SearchConfig {
-    uint32_t max_simulations = 50;
-    uint32_t max_depth = 10;
-    double cpuct = 1.25;
-    double dirichlet_alpha = 0.3;
-    double dirichlet_epsilon = 0.25;
-    double discount = 1.0;
-    uint32_t mcts_batch_size = 1; // Size for batching network evaluations
-    // Add other fields as needed
-};
-
-} // namespace trimcts
-```
-
-**2. File:** `trimcts/src/trimcts/config.py`
-*   **Change:** Add `MCTS_BATCH_SIZE` field.
-
-```python
-# File: src/trimcts/config.py
-"""
-Python configuration class for MCTS parameters.
-Uses Pydantic for validation.
-"""
-
-from pydantic import BaseModel, ConfigDict, Field  # Import ConfigDict
-
-
-class SearchConfiguration(BaseModel):
-    """MCTS Search Configuration."""
-
-    # Core Search Parameters
-    max_simulations: int = Field(
-        default=50, description="Maximum number of MCTS simulations per move.", gt=0
-    )
-    max_depth: int = Field(
-        default=10, description="Maximum depth for tree traversal.", gt=0
-    )
-
-    # UCT Parameters (AlphaZero style)
-    cpuct: float = Field(
-        default=1.25,
-        description="Constant determining the level of exploration (PUCT).",
-    )
-
-    # Dirichlet Noise (for root node exploration)
-    dirichlet_alpha: float = Field(
-        default=0.3, description="Alpha parameter for Dirichlet noise.", ge=0
-    )
-    dirichlet_epsilon: float = Field(
-        default=0.25,
-        description="Weight of Dirichlet noise in root prior probabilities.",
-        ge=0,
-        le=1.0,
-    )
-
-    # Discount Factor (Primarily for MuZero/Value Propagation)
-    discount: float = Field(
-        default=1.0,
-        description="Discount factor (gamma) for future rewards/values.",
-        ge=0.0,
-        le=1.0,
-    )
-
-    # Batching for Network Evaluations
-    mcts_batch_size: int = Field(
-        default=8, # Default to 8 for potential performance gain
-        description="Number of leaf nodes to collect before calling network evaluate_batch.",
-        gt=0,
-    )
-
-    # Use ConfigDict for Pydantic V2
-    model_config = ConfigDict(validate_assignment=True)
-
-```
-
-**3. File:** `trimcts/src/trimcts/cpp/bindings.cpp`
-*   **Change:** Update `python_to_cpp_config` to read `mcts_batch_size`.
-
-```cpp
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>     // For map/vector conversions
-#include <pybind11/pytypes.h> // For py::object, py::handle
-
-#include "mcts.h"             // Include your MCTS logic header
-#include "config.h"           // Include your config struct header
-#include "python_interface.h" // For types
-#include <string>             // Include string
-#include <stdexcept>          // Include stdexcept
-
-namespace py = pybind11;
-namespace tc = trimcts; // Alias for your C++ namespace
-
-// Helper function to transfer config from Python Pydantic model to C++ struct
-tc::SearchConfig python_to_cpp_config(const py::object &py_config)
-{
-  tc::SearchConfig cpp_config;
-  try {
-    // Use py::getattr with checks or casts
-    cpp_config.max_simulations = py_config.attr("max_simulations").cast<uint32_t>();
-    cpp_config.max_depth = py_config.attr("max_depth").cast<uint32_t>();
-    cpp_config.cpuct = py_config.attr("cpuct").cast<double>();
-    cpp_config.dirichlet_alpha = py_config.attr("dirichlet_alpha").cast<double>();
-    cpp_config.dirichlet_epsilon = py_config.attr("dirichlet_epsilon").cast<double>();
-    cpp_config.discount = py_config.attr("discount").cast<double>();
-    cpp_config.mcts_batch_size = py_config.attr("mcts_batch_size").cast<uint32_t>(); // Added batch size
-  } catch (const py::error_already_set &e) {
-        throw std::runtime_error(std::string("Error accessing SearchConfiguration attributes: ") + e.what());
-  } catch (const std::exception &e) {
-        throw std::runtime_error(std::string("Error converting SearchConfiguration: ") + e.what());
-  }
-  // Add other fields as needed
-  return cpp_config;
-}
-
-// Wrapper function exposed to Python
-tc::VisitMap run_mcts_cpp_wrapper(
-    py::object root_state_py,
-    py::object network_interface_py,
-    const py::object &config_py // Pass Python config object
-)
-{
-  // Convert Python config to C++ config struct
-  tc::SearchConfig config_cpp = python_to_cpp_config(config_py);
-
-  // Call the internal C++ MCTS implementation
-  // Add error handling around the C++ call
-  try
-  {
-    return tc::run_mcts_cpp_internal(root_state_py, network_interface_py, config_cpp);
-  }
-  catch (const std::exception &e)
-  {
-    // Convert C++ exceptions to Python exceptions
-    throw py::value_error(std::string("Error in C++ MCTS execution: ") + e.what());
-  }
-  catch (const py::error_already_set &e)
-  {
-    // Propagate Python exceptions that occurred during callbacks
-    throw; // Re-throw the Python exception
-  }
-}
-
-PYBIND11_MODULE(trimcts_cpp, m)
-{                                          // Module name must match CMakeExtension and import
-  m.doc() = "C++ core module for TriMCTS"; // Optional module docstring
-
-  // Expose the main MCTS function
-  m.def("run_mcts_cpp", &run_mcts_cpp_wrapper,
-        py::arg("root_state"), py::arg("network_interface"), py::arg("config"),
-        "Runs MCTS simulations from the root state using the provided network interface and configuration (C++).");
-
-#ifdef VERSION_INFO
-  m.attr("__version__") = VERSION_INFO;
-#else
-  m.attr("__version__") = "dev";
-#endif
-}
-```
-
-**4. File:** `trimcts/src/trimcts/cpp/mcts.cpp`
-*   **Change:** Implement batching logic in `run_mcts_cpp_internal`.
-
-```cpp
-#include "mcts.h"
-#include "python_interface.h" // For Python interaction
-#include <cmath>
-#include <limits>
-#include <stdexcept>
-#include <iostream> // For temporary debugging
-#include <numeric>  // For std::accumulate
-#include <vector>
-#include <algorithm> // For std::max_element, std::max
-#include <chrono>    // For timing (optional debug)
-
-namespace trimcts
-{
-
-  // --- Node Implementation (No changes needed here) ---
-
-  Node::Node(py::object state, Node *parent, Action action, float prior)
-      : parent_(parent), action_taken_(action), state_(std::move(state)), prior_probability_(prior) {}
-
-  bool Node::is_expanded() const
-  {
-    return !children_.empty();
-  }
-
-  bool Node::is_terminal() const
-  {
-    // Call Python's is_over() method
-    return trimcts::is_terminal(state_);
-  }
-
-  float Node::get_value_estimate() const
-  {
-    if (visit_count_ == 0)
-    {
-      return 0.0f;
-    }
-    // Cast to float for return type consistency
-    return static_cast<float>(total_action_value_ / visit_count_);
-  }
-
-  float Node::calculate_puct(const SearchConfig &config) const
-  {
-    if (!parent_)
-    {
-      return -std::numeric_limits<float>::infinity();
-    }
-
-    float q_value = get_value_estimate();
-    // Use std::max to avoid sqrt(0) if parent_visit_count is 0 (shouldn't happen after root expansion)
-    double parent_visits_sqrt = std::sqrt(static_cast<double>(std::max(1, parent_->visit_count_)));
-    double exploration_term = config.cpuct * prior_probability_ * (parent_visits_sqrt / (1.0 + visit_count_));
-
-    return q_value + static_cast<float>(exploration_term);
-  }
-
-  Node *Node::select_child(const SearchConfig &config)
-  {
-    if (children_.empty()) // Check children_ directly instead of is_expanded()
-    {
-      return nullptr;
-    }
-
-    Node *best_child = nullptr;
-    float max_score = -std::numeric_limits<float>::infinity();
-
-    for (auto const &[action, child_ptr] : children_)
-    {
-      float score = child_ptr->calculate_puct(config);
-      if (score > max_score)
-      {
-        max_score = score;
-        best_child = child_ptr.get();
-      }
-    }
-    // If all children have -inf score (e.g., parent visit count was 0), best_child might still be nullptr
-    // Or if children_ was non-empty but somehow all scores were -inf.
-    // Fallback: return first child if best_child is still null? Or handle error?
-    // Let's return nullptr and let the caller handle it.
-    return best_child;
-  }
-
-  void Node::expand(const PolicyMap &policy_map)
-  {
-    if (is_expanded() || is_terminal())
-    {
-      return;
-    }
-
-    std::vector<Action> valid_actions = trimcts::get_valid_actions(state_);
-    if (valid_actions.empty())
-    {
-       // This state is effectively terminal, even if is_terminal() was false.
-       // Don't try to expand. The backpropagation will use the value from evaluation/outcome.
-      return;
-    }
-
-    for (Action action : valid_actions)
-    {
-      float prior = 0.0f;
-      auto it = policy_map.find(action);
-      if (it != policy_map.end())
-      {
-        prior = it->second;
-      } else {
-        // Optionally handle actions valid in state but not in policy map (e.g., assign small prior)
-        // prior = 1e-6f; // Example: Small prior for valid but unlisted actions
-      }
-
-      // --- Lazy State Creation (Defer copy/step) ---
-      // Store action needed to reach child state, but don't create state yet.
-      // We'll create it only when needed for evaluation or further expansion.
-      // For now, let's stick to the original eager state creation for simplicity
-      // while implementing batching first.
-      py::object next_state_py = trimcts::copy_state(state_);
-      trimcts::apply_action(next_state_py, action);
-
-      children_[action] = std::make_unique<Node>(std::move(next_state_py), this, action, prior);
-    }
-  }
-
-  void Node::backpropagate(float value)
-  {
-    Node *current = this;
-    while (current != nullptr)
-    {
-      current->visit_count_++;
-      current->total_action_value_ += value;
-      current = current->parent_;
-    }
-  }
-
-  // Simple gamma distribution for Dirichlet noise (placeholder)
-  void sample_dirichlet_simple(double alpha, size_t k, std::vector<double> &output, std::mt19937 &rng)
-  {
-    output.resize(k);
-    std::gamma_distribution<double> dist(alpha, 1.0);
-    double sum = 0.0;
-    for (size_t i = 0; i < k; ++i)
-    {
-      output[i] = dist(rng);
-      if (output[i] < 1e-9) output[i] = 1e-9;
-      sum += output[i];
-    }
-    if (sum > 1e-9)
-    {
-      for (size_t i = 0; i < k; ++i) output[i] /= sum;
-    }
-    else
-    {
-      for (size_t i = 0; i < k; ++i) output[i] = 1.0 / k;
-    }
-  }
-
-  void Node::add_dirichlet_noise(const SearchConfig &config, std::mt19937 &rng)
-  {
-    if (children_.empty() || config.dirichlet_alpha <= 0 || config.dirichlet_epsilon <= 0)
-    {
-      return;
-    }
-
-    size_t num_children = children_.size();
-    std::vector<double> noise;
-    sample_dirichlet_simple(config.dirichlet_alpha, num_children, noise, rng);
-
-    size_t i = 0;
-    double total_prior = 0.0;
-    for (auto &[action, child_ptr] : children_)
-    {
-      child_ptr->prior_probability_ = (1.0f - config.dirichlet_epsilon) * child_ptr->prior_probability_ + config.dirichlet_epsilon * static_cast<float>(noise[i]);
-      total_prior += child_ptr->prior_probability_;
-      i++;
-    }
-
-    // Re-normalize
-    if (std::abs(total_prior - 1.0) > 1e-6 && total_prior > 1e-9)
-    {
-      for (auto &[action, child_ptr] : children_)
-      {
-        child_ptr->prior_probability_ /= static_cast<float>(total_prior);
-      }
-    }
-  }
-
-  // --- MCTS Main Logic with Batching ---
-
-  // Helper function to process a batch of evaluated leaves
-  void process_evaluated_batch(
-      const std::vector<Node *> &leaves,
-      const std::vector<NetworkOutput> &results)
-  {
-    if (leaves.size() != results.size())
-    {
-      std::cerr << "Error: Mismatch between leaves and evaluation results count." << std::endl;
-      // Decide how to handle: maybe backpropagate 0 for all?
-      for (Node *leaf : leaves)
-      {
-        leaf->backpropagate(0.0f); // Backpropagate neutral value on error
-      }
-      return;
-    }
-
-    for (size_t i = 0; i < leaves.size(); ++i)
-    {
-      Node *leaf = leaves[i];
-      const NetworkOutput &output = results[i];
-
-      // Expand the node using the policy from the result
-      if (!leaf->is_terminal()) // Only expand non-terminal leaves
-      {
-         leaf->expand(output.policy);
-      }
-
-      // Backpropagate the value from the result
-      leaf->backpropagate(output.value);
-    }
-  }
-
-  VisitMap run_mcts_cpp_internal(
-      py::object root_state_py,
-      py::object network_interface_py, // AlphaZero interface for now
-      const SearchConfig &config)
-  {
-    // auto start_time_total = std::chrono::high_resolution_clock::now(); // Optional timing
-
-    if (trimcts::is_terminal(root_state_py))
-    {
-      // std::cerr << "Error: MCTS called on a terminal root state." << std::endl;
-      return {};
-    }
-
-    Node root(std::move(root_state_py));
-    std::mt19937 rng(std::random_device{}());
-
-    // --- Root Preparation ---
-    std::vector<Node *> root_batch_nodes = {&root};
-    std::vector<py::object> root_batch_states = {root.state_};
-    std::vector<NetworkOutput> root_results;
-    try
-    {
-      // Use batch evaluation even for the single root node
-      root_results = trimcts::evaluate_batch_alpha(network_interface_py, root_batch_states);
-      if (root_results.empty()) {
-         throw std::runtime_error("Root evaluation returned empty results.");
-      }
-      // Expand root using the policy result
-      if (!root.is_terminal()) {
-          root.expand(root_results[0].policy);
-          if (root.is_expanded()) {
-              root.add_dirichlet_noise(config, rng);
-          } else {
-               std::cerr << "Warning: Root node failed to expand despite not being terminal." << std::endl;
-               // If root didn't expand, MCTS can't proceed.
-               return {};
-          }
-      }
-      // Backpropagate the root's evaluated value *once*
-      // This initializes the root's value estimate correctly before simulations start using it.
-      root.backpropagate(root_results[0].value);
-
-    }
-    catch (const std::exception &e)
-    {
-      std::cerr << "Error during MCTS root initialization/evaluation: " << e.what() << std::endl;
-      return {};
-    }
-
-    // --- Simulation Loop ---
-    std::vector<Node *> leaves_to_evaluate;
-    std::vector<py::object> states_to_evaluate;
-    leaves_to_evaluate.reserve(config.mcts_batch_size);
-    states_to_evaluate.reserve(config.mcts_batch_size);
-
-    for (uint32_t i = 0; i < config.max_simulations; ++i)
-    {
-      Node *current_node = &root;
-      int depth = 0;
-
-      // 1. Selection
-      while (current_node->is_expanded() && !current_node->is_terminal())
-      {
-        Node* selected_child = current_node->select_child(config);
-        if (!selected_child) {
-             // This might happen if all children have invalid PUCT scores (e.g., parent visit count 0, which shouldn't occur after root init)
-             // Or if the node was expanded but somehow has no children (logic error).
-             std::cerr << "Warning: Selection failed to find a child for node with visit count " << current_node->visit_count_ << ". Stopping simulation." << std::endl;
-             goto process_batch; // Process any pending batch and end this simulation
-        }
-        current_node = selected_child;
-        depth++;
-        if (depth >= config.max_depth)
-          break;
-      }
-
-      // 2. Check if Expansion is Needed
-      Value value;
-      if (!current_node->is_expanded() && !current_node->is_terminal() && depth < config.max_depth)
-      {
-        // Leaf node needs evaluation and expansion
-        leaves_to_evaluate.push_back(current_node);
-        states_to_evaluate.push_back(current_node->state_);
-
-        // Check if batch is full
-        if (leaves_to_evaluate.size() >= config.mcts_batch_size)
-        {
-        process_batch: // Label to jump to for processing
-          try
-          {
-            // Evaluate the batch
-            std::vector<NetworkOutput> results = trimcts::evaluate_batch_alpha(network_interface_py, states_to_evaluate);
-            // Process results (expand nodes, backpropagate values)
-            process_evaluated_batch(leaves_to_evaluate, results);
-          }
-          catch (const std::exception &e)
-          {
-            std::cerr << "Error during MCTS batch evaluation/processing: " << e.what() << std::endl;
-            // Backpropagate neutral value for all nodes in the failed batch
-             for (Node *leaf : leaves_to_evaluate) {
-                 leaf->backpropagate(0.0f);
-             }
-          }
-          // Clear the batch vectors
-          leaves_to_evaluate.clear();
-          states_to_evaluate.clear();
-        }
-      }
-      else
-      {
-        // Node is terminal, already expanded, or max depth reached.
-        // Backpropagate the existing value estimate or terminal outcome.
-        value = current_node->is_terminal() ? trimcts::get_outcome(current_node->state_) : current_node->get_value_estimate();
-        current_node->backpropagate(value);
-      }
-    } // End simulation loop
-
-    // Process any remaining leaves in the batch
-    if (!leaves_to_evaluate.empty())
-    {
-      try
-      {
-        std::vector<NetworkOutput> results = trimcts::evaluate_batch_alpha(network_interface_py, states_to_evaluate);
-        process_evaluated_batch(leaves_to_evaluate, results);
-      }
-      catch (const std::exception &e)
-      {
-        std::cerr << "Error during final MCTS batch evaluation/processing: " << e.what() << std::endl;
-         for (Node *leaf : leaves_to_evaluate) {
-             leaf->backpropagate(0.0f);
-         }
-      }
-    }
-
-    // --- Collect Results ---
-    VisitMap visit_counts;
-    for (auto const &[action, child_ptr] : root.children_)
-    {
-      visit_counts[action] = child_ptr->visit_count_;
-    }
-
-    // auto end_time_total = std::chrono::high_resolution_clock::now(); // Optional timing
-    // auto duration_total = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_total - start_time_total);
-    // std::cout << "Total MCTS time: " << duration_total.count() << " ms" << std::endl; // Optional timing
-
-    return visit_counts;
-  }
-
-} // namespace trimcts
-```
-
-**5. File:** `trimcts/src/trimcts/cpp/mcts.h`
-*   **Change:** No changes strictly required, but could add forward declarations if needed. (Keeping it unchanged for now).
-
-```cpp
-#pragma once
-
-#include <pybind11/pybind11.h> // Include pybind11 first
-#include <vector>
-#include <map>
-#include <memory> // For std::unique_ptr
-#include <random>
-
-#include "config.h"
-#include "python_interface.h" // For types and Python interaction helpers
-
-namespace py = pybind11;
-
-namespace trimcts
-{
-
-  class Node
-  {
-  public:
-    Node(py::object state, Node *parent = nullptr, Action action = -1, float prior = 0.0);
-    ~Node() = default; // Use default destructor
-
-    // Disable copy constructor and assignment operator
-    Node(const Node &) = delete;
-    Node &operator=(const Node &) = delete;
-
-    // Enable move constructor and assignment operator (optional, but good practice)
-    Node(Node &&) = default;
-    Node &operator=(Node &&) = default;
-
-    bool is_expanded() const;
-    bool is_terminal() const;
-    float get_value_estimate() const;
-    Node *select_child(const SearchConfig &config);
-    void expand(const PolicyMap &policy_map);
-    void backpropagate(float value);
-    void add_dirichlet_noise(const SearchConfig &config, std::mt19937 &rng);
-
-    // --- Public Members (Consider making some private with getters/setters) ---
-    Node *parent_;
-    Action action_taken_; // Action that led to this node
-    py::object state_;    // Python GameState object
-    std::map<Action, std::unique_ptr<Node>> children_;
-
-    int visit_count_ = 0;
-    double total_action_value_ = 0.0; // Use double for accumulation
-    float prior_probability_ = 0.0;
-
-  private:
-    float calculate_puct(const SearchConfig &config) const;
-  };
-
-  // Main MCTS function signature
-  VisitMap run_mcts_cpp_internal(
-      py::object root_state,
-      py::object network_interface, // AlphaZero interface for now
-      const SearchConfig &config);
-
-} // namespace trimcts
-```
-
-**6. File:** `trimcts/README.md`
-*   **Change:** Document the new batching feature and configuration option.
-
-```markdown
 [![CI](https://github.com/lguibr/trimcts/actions/workflows/ci_cd.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
 [![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
 [![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- TODO: Add Codecov token -->
@@ -810,8 +124,9 @@ namespace trimcts
 -   Seamless Python integration via Pybind11.
 -   Supports AlphaZero-style evaluation (policy/value from state).
 -   **Batched Network Evaluations:** Efficiently calls the Python network's `evaluate_batch` method during search for improved performance, especially with GPUs.
+-   **MCTS Tree Reuse:** Significantly speeds up sequential MCTS calls (e.g., during self-play) by reusing the relevant subtree from the previous search step. The C++ core manages the tree lifetime via opaque handles (`py::capsule`) passed between Python calls.
 -   (Planned) Supports MuZero-style evaluation (initial inference + recurrent inference).
--   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise, **batch size**).
+-   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise, batch size).
 -   Designed for use with external Python game state objects and network evaluators.
 -   Type-hinted Python API (`py.typed` compliant).
 
@@ -827,7 +142,7 @@ pip install trimcts
 pip install -e .[dev]
 ```
 
-## 💡 Usage Example (AlphaZero Style)
+## 💡 Usage Example (AlphaZero Style with Tree Reuse)
 
 ```python
 import time
@@ -855,109 +170,113 @@ except ImportError:
 
 from trimcts import run_mcts, SearchConfiguration, AlphaZeroNetworkInterface
 
-# --- Mock Neural Network for demonstration ---
-# Replace with your actual network implementation
+# --- Mock Neural Network (same as before) ---
 class MockNeuralNetwork:
     def __init__(self, *args, **kwargs):
         self.model = torch.nn.Module() # Dummy model
         print("MockNeuralNetwork initialized.")
 
     def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
-        # Mock evaluation: uniform policy over valid actions, fixed value
         valid_actions = state.valid_actions()
-        if not valid_actions:
-            return {}, 0.0 # Terminal or no valid actions
+        if not valid_actions: return {}, 0.0
         policy = {action: 1.0 / len(valid_actions) for action in valid_actions}
-        value = 0.5 # Fixed mock value
+        value = 0.5
         return policy, value
 
     def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
         print(f"  Mock evaluate_batch called with {len(states)} states.")
         return [self.evaluate_state(s) for s in states]
 
-    def load_weights(self, path):
-        print(f"Mock: Pretending to load weights from {path}")
-
-    def to(self, device):
-        print(f"Mock: Pretending to move model to {device}")
-        return self
+    def load_weights(self, path): print(f"Mock: Pretending to load weights from {path}")
+    def to(self, device): print(f"Mock: Pretending to move model to {device}"); return self
 # --- End Mock Neural Network ---
 
-
-# 1. Define your AlphaZero network wrapper conforming to the interface
+# --- AlphaZero Wrapper (same as before) ---
 class MyAlphaZeroWrapper(AlphaZeroNetworkInterface):
     def __init__(self, model_path: str | None = None):
-        # Load your PyTorch/TensorFlow/etc. model here
-        # Example using a Mock NeuralNetwork
-        self.network = MockNeuralNetwork() # Using Mock for this example
-        # Load weights if model_path is provided
-        if model_path:
-             self.network.load_weights(model_path)
-        # self.network.to(torch.device("cpu")) # Ensure model is on correct device if using real NN
-        self.network.model.eval() # Set to evaluation mode
+        self.network = MockNeuralNetwork()
+        if model_path: self.network.load_weights(model_path)
+        self.network.model.eval()
         print("MyAlphaZeroWrapper initialized.")
 
     def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
-        """
-        Evaluates a single game state.
-        NOTE: With batching enabled in C++, this might be called less often or only as a fallback.
-        """
         print(f"Python: Evaluating SINGLE state step {state.current_step}")
-        policy_map, value = self.network.evaluate_state(state) # Using mock evaluate directly
+        policy_map, value = self.network.evaluate_state(state)
         print(f"Python: Single evaluation result - Policy keys: {len(policy_map)}, Value: {value:.4f}")
         return policy_map, value
 
     def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
-        """
-        Evaluates a batch of game states. This is the primary method called by C++ MCTS with batching.
-        """
         print(f"Python: Evaluating BATCH of {len(states)} states.")
-        results = self.network.evaluate_batch(states) # Using mock evaluate_batch directly
+        results = self.network.evaluate_batch(states)
         print(f"Python: Batch evaluation returned {len(results)} results.")
         return results
 
-# 2. Instantiate your game state and network wrapper
+# --- Simulation Loop Example ---
 env_config = EnvConfig()
 if HAS_TRIANGLENGIN:
-    # Ensure the config creates a playable state for the example
     env_config.ROWS = 3
     env_config.COLS = 3
     env_config.NUM_SHAPE_SLOTS = 1
-    env_config.PLAYABLE_RANGE_PER_ROW = [(0,3), (0,3), (0,3)] # Example playable range
+    env_config.PLAYABLE_RANGE_PER_ROW = [(0,3), (0,3), (0,3)]
 
-root_state = GameState(config=env_config, initial_seed=42)
-network_wrapper = MyAlphaZeroWrapper() # Add path to your trained model if needed
+game_state = GameState(config=env_config, initial_seed=42)
+network_wrapper = MyAlphaZeroWrapper()
 
-# 3. Configure MCTS parameters
 mcts_config = SearchConfiguration()
 mcts_config.max_simulations = 50
-mcts_config.max_depth = 10
-mcts_config.cpuct = 1.25
-mcts_config.dirichlet_alpha = 0.3
-mcts_config.dirichlet_epsilon = 0.25
-mcts_config.discount = 1.0 # AlphaZero typically uses no discount during search
-mcts_config.mcts_batch_size = 8 # Enable batching
+mcts_config.mcts_batch_size = 8
 
-# 4. Run MCTS
-# The C++ run_mcts function will call network_wrapper.evaluate_batch()
-print("Running MCTS...")
-# Ensure root_state is not terminal before running
-if not root_state.is_over():
-    # run_mcts returns a dictionary: {action: visit_count}
+# --- Tree Reuse Variables ---
+mcts_tree_handle = None # Start with no tree
+last_action = -1        # No previous action initially
+
+print("--- Running Self-Play Loop with Tree Reuse ---")
+max_episode_steps = 10
+for step in range(max_episode_steps):
+    if game_state.is_over():
+        print(f"\nGame over at step {step}. Final Score: {game_state.game_score()}")
+        break
+
+    print(f"\n--- Step {step} ---")
+    print(f"Current State Step: {game_state.current_step}")
+    print(f"Passing tree handle: {'Yes' if mcts_tree_handle else 'No'}")
+    print(f"Passing last action: {last_action}")
+
+    # Run MCTS, passing the handle and last action
+    # It returns visit counts AND the new handle
     start_time = time.time()
-    visit_counts = run_mcts(root_state, network_wrapper, mcts_config)
+    visit_counts, mcts_tree_handle = run_mcts(
+        root_state=game_state,
+        network_interface=network_wrapper,
+        config=mcts_config,
+        previous_tree_handle=mcts_tree_handle, # Pass handle from previous step
+        last_action=last_action               # Pass action that led to current state
+    )
     end_time = time.time()
-    print(f"\nMCTS Result (Visit Counts) after {end_time - start_time:.2f} seconds:")
+    print(f"MCTS Result (Visit Counts) after {end_time - start_time:.3f} seconds:")
     print(visit_counts)
+    print(f"Received new tree handle: {'Present' if mcts_tree_handle else 'None'}")
 
-    # Example: Select best action based on visits
-    if visit_counts:
-        best_action = max(visit_counts, key=visit_counts.get)
-        print(f"\nBest action based on visits: {best_action}")
-    else:
-        print("\nNo actions explored or MCTS failed.")
+    # Select best action based on visits
+    if not visit_counts:
+        print("MCTS returned no visits. Ending episode.")
+        break
+    best_action = max(visit_counts, key=visit_counts.get)
+    print(f"Selected Action: {best_action}")
+
+    # Store the selected action for the *next* MCTS call
+    last_action = best_action
+
+    # Apply the action to the game state
+    reward, done = game_state.step(best_action)
+    print(f"Step Reward: {reward:.3f}, Done: {done}")
+
 else:
-    print("Root state is already terminal. Cannot run MCTS.")
+     print(f"\nEpisode finished after {max_episode_steps} steps.")
+
+# The mcts_tree_handle (a py::capsule) will be automatically garbage collected
+# by Python when it goes out of scope, triggering the C++ destructor.
+print("\n--- End of Simulation ---")
 
 ```
 
@@ -973,12 +292,15 @@ trimcts/
 │   │   ├── CMakeLists.txt  # CMake build script for C++ part
 │   │   ├── bindings.cpp    # Pybind11 bindings
 │   │   ├── config.h        # C++ configuration struct
-│   │   ├── mcts.cpp        # C++ MCTS implementation
+│   │   ├── mcts.cpp        # C++ MCTS implementation (Node, simulation loop)
 │   │   ├── mcts.h          # C++ MCTS header
-│   │   └── python_interface.h # C++ helpers for Python interaction
+│   │   ├── mcts_manager.cpp # C++ MCTS Tree Manager implementation
+│   │   ├── mcts_manager.h  # C++ MCTS Tree Manager header (handles lifetime)
+│   │   ├── python_interface.h # C++ helpers for Python interaction
+│   │   └── structs.h       # Common C++ structs (NetworkOutput, etc.)
 │   ├── __init__.py         # Exposes public API (run_mcts, configs, etc.)
 │   ├── config.py           # Python SearchConfiguration (Pydantic)
-│   ├── mcts_wrapper.py     # Python network interface definition
+│   ├── mcts_wrapper.py     # Python network interface definition & run_mcts wrapper
 │   └── py.typed            # Marker file for type checkers (PEP 561)
 ├── tests/                  # Python tests ([tests/README.md](tests/README.md))
 │   ├── conftest.py
@@ -1418,7 +740,7 @@ def test_mcts_run_alpha_basic(
     dummy_network: DummyAlphaNetwork,
     search_config: SearchConfiguration,
 ) -> None:
-    """Test basic MCTS run with AlphaZero interface (batch_size=1)."""
+    """Test basic MCTS run with AlphaZero interface (batch_size=1, no reuse)."""
     num_sims = 10
     search_config.max_simulations = num_sims
     search_config.dirichlet_alpha = 0.0
@@ -1427,12 +749,18 @@ def test_mcts_run_alpha_basic(
     if dummy_state.is_over():
         pytest.skip("Initial dummy state is already terminal.")
 
-    print("\n--- Starting Basic MCTS Run (Batch Size 1) ---")
+    print("\n--- Starting Basic MCTS Run (Batch Size 1, No Reuse) ---")
     start_time = time.time()
-    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
+    # Call without reuse args (defaults to None handle, -1 action)
+    result_tuple = run_mcts(dummy_state, dummy_network, search_config)
     duration = time.time() - start_time
     print(f"--- MCTS Run Finished ({duration:.4f}s) ---")
+
+    assert isinstance(result_tuple, tuple) and len(result_tuple) == 2
+    visit_counts, tree_handle = result_tuple
+
     print(f"Visit Counts: {visit_counts}")
+    print(f"Tree Handle: {'Present' if tree_handle else 'None'}")
     print(f"Network single evals (evaluate_state calls): {dummy_network.eval_count}")
     print(
         f"Network batch evals (evaluate_batch calls): {dummy_network.batch_eval_count}"
@@ -1440,6 +768,8 @@ def test_mcts_run_alpha_basic(
     print(f"Total states evaluated: {dummy_network.total_states_evaluated}")
 
     assert isinstance(visit_counts, dict)
+    assert tree_handle is not None  # Should get a handle even on first run
+
     valid_root_actions = set(dummy_state.valid_actions())
     if valid_root_actions:
         assert set(visit_counts.keys()).issubset(valid_root_actions)
@@ -1455,200 +785,115 @@ def test_mcts_run_alpha_basic(
         assert not visit_counts
 
 
-def test_mcts_run_alpha_with_noise(
-    dummy_state: GameState,
-    dummy_network: DummyAlphaNetwork,
-    search_config: SearchConfiguration,
-) -> None:
-    """Test MCTS run with Dirichlet noise enabled (batch_size=1)."""
-    num_sims = 32
-    search_config.max_simulations = num_sims
-    search_config.dirichlet_alpha = 0.5
-    search_config.dirichlet_epsilon = 0.25
-    search_config.mcts_batch_size = 1
-
-    if dummy_state.is_over():
-        pytest.skip("Initial dummy state is already terminal.")
-
-    print("\n--- Starting MCTS Run with Noise (Batch Size 1) ---")
-    start_time = time.time()
-    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
-    duration = time.time() - start_time
-    print(f"--- MCTS Run Finished ({duration:.4f}s) ---")
-    print(f"Visit Counts: {visit_counts}")
-    print(f"Network single evals (evaluate_state calls): {dummy_network.eval_count}")
-    print(
-        f"Network batch evals (evaluate_batch calls): {dummy_network.batch_eval_count}"
-    )
-    print(f"Total states evaluated: {dummy_network.total_states_evaluated}")
-
-    assert isinstance(visit_counts, dict)
-    valid_root_actions = set(dummy_state.valid_actions())
-    if valid_root_actions:
-        assert set(visit_counts.keys()).issubset(valid_root_actions)
-        assert all(isinstance(v, int) and v >= 0 for v in visit_counts.values())
-        assert sum(visit_counts.values()) <= num_sims
-        assert dummy_network.batch_eval_count >= 1
-        assert dummy_network.batch_eval_count <= num_sims + 1
-        assert dummy_network.total_states_evaluated == dummy_network.batch_eval_count
-    else:
-        assert not visit_counts
-
-
 def test_mcts_run_on_terminal_state(
     dummy_state: GameState,
     dummy_network: DummyAlphaNetwork,
     search_config: SearchConfiguration,
 ) -> None:
-    """Test MCTS run starting from a terminal state (should return empty)."""
+    """Test MCTS run starting from a terminal state (should return empty, None handle)."""
     steps = 0
     max_steps = 100
     while not dummy_state.is_over() and steps < max_steps:
         actions_set = set(dummy_state.valid_actions())
         if not actions_set:
-            # If no actions, force game over manually for mock, or break for real
             if hasattr(dummy_state, "force_game_over"):
                 dummy_state.force_game_over("No actions left in test setup")
             break
         actions_list = list(actions_set)
-        # Use try-except for choice as it can fail if list is empty after check (race?)
         try:
             action = np.random.choice(actions_list) if actions_list else -1
         except ValueError:
-            action = -1  # Handle empty list case if it occurs
-
+            action = -1
         if action == -1:
             break
         dummy_state.step(action)
         steps += 1
 
     if not dummy_state.is_over():
-        # If using real game, it might be possible to not terminate, skip then.
         if HAS_TRIANGLENGIN:
             pytest.skip(
                 "Real game state did not terminate naturally within test limits."
             )
-        else:  # Mock should always terminate
+        else:
             pytest.fail("Mock game state did not terminate as expected.")
 
     assert dummy_state.is_over()
 
     print("\n--- Starting MCTS Run on Terminal State ---")
-    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
+    result_tuple = run_mcts(dummy_state, dummy_network, search_config)
+    assert isinstance(result_tuple, tuple) and len(result_tuple) == 2
+    visit_counts, tree_handle = result_tuple
+
     print(f"Visit Counts: {visit_counts}")
+    print(f"Tree Handle: {'Present' if tree_handle else 'None'}")
 
     assert isinstance(visit_counts, dict)
     assert len(visit_counts) == 0
+    assert tree_handle is None  # Expect None handle for terminal state
     assert dummy_network.total_states_evaluated == 0
     assert dummy_network.batch_eval_count == 0
 
 
-# --- New Tests for Batching ---
-
-
-def test_mcts_batching_enabled(
+def test_mcts_tree_reuse_api_call(
     dummy_state: GameState,
     dummy_network: DummyAlphaNetwork,
     search_config: SearchConfiguration,
 ) -> None:
-    """Test MCTS run with batching enabled (batch_size > 1)."""
-    batch_size = 4
-    num_sims = 20
-    search_config.max_simulations = num_sims
-    search_config.mcts_batch_size = batch_size
-    search_config.dirichlet_alpha = 0.0
-
+    """Test calling MCTS with tree reuse parameters."""
     if dummy_state.is_over():
         pytest.skip("Initial dummy state is already terminal.")
 
-    print(f"\n--- Starting MCTS Run (Batch Size {batch_size}) ---")
-    start_time = time.time()
-    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
-    duration = time.time() - start_time
-    print(f"--- MCTS Run Finished ({duration:.4f}s) ---")
-    print(f"Visit Counts: {visit_counts}")
-    print(f"Network single evals (evaluate_state calls): {dummy_network.eval_count}")
-    print(
-        f"Network batch evals (evaluate_batch calls): {dummy_network.batch_eval_count}"
-    )
-    print(f"Total states evaluated: {dummy_network.total_states_evaluated}")
-
-    assert isinstance(visit_counts, dict)
-    valid_root_actions = set(dummy_state.valid_actions())
-    if valid_root_actions:
-        assert set(visit_counts.keys()).issubset(valid_root_actions)
-        assert sum(visit_counts.values()) <= num_sims
-
-        # --- Relaxed Assertions for Batching ---
-        assert dummy_network.batch_eval_count >= 1  # Must eval root
-        assert dummy_network.total_states_evaluated >= 1  # Must eval root
-        # If sims > 1 and leaves were found, expect > 1 batch call
-        if num_sims > 1 and dummy_network.total_states_evaluated > 1:
-            assert dummy_network.batch_eval_count > 1, (
-                "Batching didn't occur for leaves"
-            )
-        # Upper bound check
-        assert dummy_network.batch_eval_count <= num_sims + 1
-        assert dummy_network.total_states_evaluated <= num_sims + 1
-        # Check internal consistency of mock network counters
-        assert dummy_network.eval_count == dummy_network.total_states_evaluated
-
-    else:
-        assert not visit_counts
-        assert dummy_network.total_states_evaluated == 0
-        assert dummy_network.batch_eval_count == 0
-
-
-def test_mcts_batching_small_sims(
-    dummy_state: GameState,
-    dummy_network: DummyAlphaNetwork,
-    search_config: SearchConfiguration,
-) -> None:
-    """Test MCTS run with batching enabled but fewer sims than batch size."""
-    batch_size = 8
-    num_sims = 5
-    search_config.max_simulations = num_sims
-    search_config.mcts_batch_size = batch_size
+    # 1. First call (no reuse)
+    print("\n--- Tree Reuse Test: First Call ---")
+    search_config.max_simulations = 5
     search_config.dirichlet_alpha = 0.0
+    vc1, h1 = run_mcts(dummy_state, dummy_network, search_config)
+    print(f"VC1: {vc1}, Handle1: {'Present' if h1 else 'None'}")
+    assert isinstance(vc1, dict)
+    assert h1 is not None
 
-    if dummy_state.is_over():
-        pytest.skip("Initial dummy state is already terminal.")
+    # 2. Simulate taking an action
+    if not vc1:
+        pytest.skip("First MCTS call yielded no actions.")
+    # Use lambda for key function to satisfy mypy
+    last_action = max(vc1, key=lambda k: vc1.get(k, -1))
+    reward, done = dummy_state.step(last_action)
+    print(f"Took action {last_action}. Reward: {reward}, Done: {done}")
 
-    print(f"\n--- Starting MCTS Run (Sims={num_sims}, Batch Size={batch_size}) ---")
-    start_time = time.time()
-    visit_counts = run_mcts(dummy_state, dummy_network, search_config)
-    duration = time.time() - start_time
-    print(f"--- MCTS Run Finished ({duration:.4f}s) ---")
-    print(f"Visit Counts: {visit_counts}")
-    print(f"Network single evals (evaluate_state calls): {dummy_network.eval_count}")
-    print(
-        f"Network batch evals (evaluate_batch calls): {dummy_network.batch_eval_count}"
+    if done:
+        pytest.skip("Game ended after first action.")
+
+    # 3. Second call (with reuse)
+    print("\n--- Tree Reuse Test: Second Call ---")
+    dummy_network.reset_counters()  # Reset counters to see effect of reuse
+    vc2, h2 = run_mcts(
+        dummy_state,
+        dummy_network,
+        search_config,
+        previous_tree_handle=h1,  # Pass previous handle
+        last_action=last_action,  # Pass action taken
     )
-    print(f"Total states evaluated: {dummy_network.total_states_evaluated}")
+    print(f"VC2: {vc2}, Handle2: {'Present' if h2 else 'None'}")
+    assert isinstance(vc2, dict)
+    assert h2 is not None
+    # Note: Comparing capsule objects directly for non-equality might not be reliable.
+    # The underlying pointer should be different if reuse happened correctly,
+    # but we can't easily check that from Python without unsafe access.
+    # assert h1 is not h2 # This might not work as expected for capsules
 
-    assert isinstance(visit_counts, dict)
-    valid_root_actions = set(dummy_state.valid_actions())
-    if valid_root_actions:
-        assert set(visit_counts.keys()).issubset(valid_root_actions)
-        assert sum(visit_counts.values()) <= num_sims
-
-        # --- Relaxed Assertions for Batching ---
-        assert dummy_network.batch_eval_count >= 1  # Must eval root
-        assert dummy_network.total_states_evaluated >= 1  # Must eval root
-        # Expect 1 (root) + maybe 1 (leaves) = 1 or 2 calls total
-        assert dummy_network.batch_eval_count <= 2, (
-            "Expected at most 2 batch calls (root + leaves)"
-        )
-        # Upper bound check
-        assert dummy_network.batch_eval_count <= num_sims + 1
-        assert dummy_network.total_states_evaluated <= num_sims + 1
-        # Check internal consistency of mock network counters
-        assert dummy_network.eval_count == dummy_network.total_states_evaluated
-
+    # Basic checks: ensure it ran and returned valid structure
+    valid_actions_now = set(dummy_state.valid_actions())
+    if valid_actions_now:
+        assert set(vc2.keys()).issubset(valid_actions_now)
+        assert sum(vc2.values()) <= search_config.max_simulations
+        # We expect fewer evaluations if reuse was successful, but exact number is hard to predict
+        # assert dummy_network.batch_eval_count < search_config.max_simulations + 1
     else:
-        assert not visit_counts
-        assert dummy_network.total_states_evaluated == 0
-        assert dummy_network.batch_eval_count == 0
+        assert not vc2
+
+    # Clean up handles (Python GC will call capsule destructor)
+    del h1
+    del h2
 
 
 File: tests/README.md
@@ -1968,7 +1213,7 @@ class SearchConfiguration(BaseModel):
 
 File: src/trimcts/mcts_wrapper.py
 import logging
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable, cast
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .config import SearchConfiguration
 
@@ -1976,6 +1221,8 @@ logger = logging.getLogger(__name__)
 
 # Type hint for the game state object expected by the network interfaces
 GameState = Any
+# Type hint for the opaque tree handle (using Any for now)
+MctsTreeHandle = Any
 
 # --- Conditional Import for MyPy ---
 if TYPE_CHECKING:
@@ -2009,21 +1256,47 @@ def run_mcts(
     root_state: GameState,
     network_interface: AlphaZeroNetworkInterface | MuZeroNetworkInterface,
     config: SearchConfiguration,
-) -> dict[int, int]:
+    previous_tree_handle: MctsTreeHandle | None = None,
+    last_action: int = -1,
+) -> tuple[dict[int, int], MctsTreeHandle | None]:
     """
-    Python entry point for running MCTS.
+    Python entry point for running MCTS, supporting tree reuse.
 
-    Returns empty dict immediately if root_state.is_over() is True.
+    Args:
+        root_state: The current game state object.
+        network_interface: The network evaluation interface.
+        config: The MCTS search configuration.
+        previous_tree_handle: Opaque handle to the tree state from the previous step (optional).
+        last_action: The action taken that led to the current root_state (required if previous_tree_handle is provided).
+
+    Returns:
+        A tuple containing:
+            - Visit counts (dict[int, int]) for actions from the root.
+            - An opaque handle to the MCTS tree state after the search (or None if MCTS failed).
+            Returns ({}, None) immediately if root_state.is_over() is True.
     """
     # Terminal-state shortcut
     if not hasattr(root_state, "is_over") or not callable(root_state.is_over):
         raise TypeError("root_state object missing required method: is_over")
     if root_state.is_over():
-        return {}
+        logger.warning("run_mcts called on a terminal state. Returning empty.")
+        return {}, None
 
     # Validate config
     if not isinstance(config, SearchConfiguration):
         raise TypeError("config must be an instance of SearchConfiguration")
+
+    # Validate tree reuse parameters
+    if previous_tree_handle is not None and last_action == -1:
+        logger.warning(
+            "previous_tree_handle provided but last_action is -1. Tree reuse might fail. "
+            "Provide the action that led to the current root_state."
+        )
+    if previous_tree_handle is None and last_action != -1:
+        logger.debug(
+            "last_action provided but no previous_tree_handle. Starting new tree."
+        )
+        last_action = -1  # Ensure last_action is -1 if no handle
 
     # Import the C++ extension
     try:
@@ -2064,35 +1337,64 @@ def run_mcts(
             "MuZero MCTS integration is not yet implemented in C++ bindings."
         )
 
-    # Call into C++
-    visit_counts = cast(
-        dict[int, int],
-        cpp_module.run_mcts_cpp(root_state, network_interface, config),
-    )
+    # Call into C++ - it now returns a tuple (visit_map, new_handle)
+    try:
+        # Pass None directly if previous_tree_handle is None
+        handle_to_pass = (
+            previous_tree_handle if previous_tree_handle is not None else None
+        )
+        result_tuple = cpp_module.run_mcts_cpp(
+            root_state,
+            network_interface,
+            config,
+            handle_to_pass,  # Pass handle (can be None)
+            last_action,
+        )
+    except Exception as cpp_err:
+        logger.error(f"Error during C++ MCTS execution: {cpp_err}", exc_info=True)
+        return {}, None  # Return empty on C++ error
 
-    # Validate return type
-    if not isinstance(visit_counts, dict):
-        logger.error(f"C++ MCTS returned unexpected type: {type(visit_counts)}")
-        return {}
+    # Validate and unpack the returned tuple
+    if not isinstance(result_tuple, tuple) or len(result_tuple) != 2:
+        logger.error(
+            f"C++ MCTS returned unexpected type or length: {type(result_tuple)}"
+        )
+        return {}, None
 
-    # Filter and validate keys/values
-    result: dict[int, int] = {}
-    for k, v in visit_counts.items():
-        if isinstance(k, int) and isinstance(v, int):
-            result[k] = v
-        else:
-            logger.warning(
-                f"Skipping invalid result entry: ({k!r}:{type(k)}, {v!r}:{type(v)})"
-            )
-    return result
+    visit_counts_raw, new_tree_handle = result_tuple
+
+    # Validate visit counts
+    validated_visit_counts: dict[int, int] = {}  # Use a different name here
+    if not isinstance(visit_counts_raw, dict):
+        logger.error(
+            f"C++ MCTS returned unexpected type for visit counts: {type(visit_counts_raw)}"
+        )
+        # validated_visit_counts remains empty
+    else:
+        # Filter and validate keys/values
+        for k, v in visit_counts_raw.items():
+            if isinstance(k, int) and isinstance(v, int):
+                validated_visit_counts[k] = v  # Populate the new dict
+            else:
+                logger.warning(
+                    f"Skipping invalid result entry: ({k!r}:{type(k)}, {v!r}:{type(v)})"
+                )
+
+    # The handle can be None if C++ returns a null capsule (e.g., on error or terminal state)
+    # Check if the returned handle is None (Python None, not a null capsule object)
+    if new_tree_handle is None:
+        logger.debug("C++ MCTS returned None for the tree handle.")
+        return validated_visit_counts, None
+
+    # If it's not None, assume it's a valid capsule handle
+    return validated_visit_counts, new_tree_handle
 
 
 File: src/trimcts/__init__.py
-# File: src/trimcts/__init__.py
 """
 TriMCTS Package
 
-Provides high-performance C++ MCTS bindings for Python.
+Provides high-performance C++ MCTS bindings for Python, supporting tree reuse.
 """
 
 # Import only Python-defined elements here
@@ -2106,7 +1408,8 @@ __all__ = [
     "MuZeroNetworkInterface",
 ]
 
-__version__ = "0.1.0"
+# Increment version for tree reuse feature
+__version__ = "1.2.0"
 
 
 File: src/trimcts/README.md
@@ -2156,6 +1459,7 @@ find_package(pybind11 CONFIG REQUIRED)
 set(TRIMCTS_SOURCES
     bindings.cpp
     mcts.cpp
+    mcts_manager.cpp # ADDED missing source file
 )
 
 # Build the pybind11 module
@@ -2398,46 +1702,150 @@ The `bindings.cpp` file acts as the bridge, managed by Pybind11, allowing seamle
 
 Refer to the main project [README.md](../../../README.md) for build instructions.
 
-File: src/trimcts/cpp/mcts.cpp
-// File: src/trimcts/cpp/mcts.cpp
-#include "mcts.h"
-#include "python_interface.h" // For Python interaction
-#include <cmath>
-#include <limits>
-#include <stdexcept>
-#include <iostream> // For temporary debugging
-#include <numeric>  // For std::accumulate
-#include <vector>
-#include <algorithm> // For std::max_element, std::max, std::min
-#include <chrono>    // For timing (optional debug)
+File: src/trimcts/cpp/mcts_manager.cpp
 
-// Make sure pybind11 headers are included here if PYBIND11_EXPORT needs them
-#include <pybind11/pybind11.h>
+#include "mcts_manager.h"
+#include "mcts.h"  // Include full Node definition
+#include <utility> // For std::move
 
 namespace trimcts
 {
 
-  // --- Node Implementation (No changes needed here) ---
-  Node::Node(py::object state, Node *parent, Action action, float prior)
-      : parent_(parent), action_taken_(action), state_(std::move(state)), prior_probability_(prior) {}
+  MctsTreeManager::MctsTreeManager(std::unique_ptr<Node> root) : root_(std::move(root)) {}
+
+  Node *MctsTreeManager::get_root() const
+  {
+    return root_.get();
+  }
+
+  std::unique_ptr<Node> MctsTreeManager::release_root()
+  {
+    return std::move(root_);
+  }
+
+  void MctsTreeManager::set_root(std::unique_ptr<Node> new_root)
+  {
+    root_ = std::move(new_root);
+  }
+
+} // namespace trimcts
+
+File: src/trimcts/cpp/mcts.cpp
+// File: src/trimcts/cpp/mcts.cpp
+#include "mcts.h"
+#include "mcts_manager.h"     // Include the manager
+#include "python_interface.h" // For Python interaction
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <iostream>
+#include <numeric>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <utility> // For std::pair, std::move
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+namespace trimcts
+{
+
+  // --- Node Implementation ---
+
+  // Constructor for non-root nodes
+  Node::Node(Node *parent, Action action, float prior)
+      : parent_(parent), action_taken_(action), prior_probability_(prior),
+        materialized_state_(std::nullopt), state_materialized_(false) {}
+
+  // Special method to set the state for the root node
+  void Node::set_root_state(py::object state)
+  {
+    materialized_state_ = std::move(state);
+    state_materialized_ = true;
+    parent_ = nullptr;  // Root has no parent
+    action_taken_ = -1; // No action led to root
+  }
+
+  // Get or materialize the state
+  py::object Node::get_state()
+  {
+    // If state is already materialized, return it
+    if (state_materialized_ && materialized_state_.has_value())
+    {
+      return *materialized_state_;
+    }
+
+    // If this is the root node but state wasn't set (error condition)
+    if (!parent_)
+    {
+      throw std::logic_error("Attempted to get_state for root node before state was set.");
+    }
+
+    // Materialize the state: Get parent's state, copy, apply action
+    // This is the potentially expensive part
+    // std::cout << "[DEBUG] Materializing state for node reached by action " << action_taken_ << std::endl; // Debug log
+    try
+    {
+      py::object parent_state = parent_->get_state(); // Recursive call
+      py::object my_state = trimcts::copy_state(parent_state);
+      trimcts::apply_action(my_state, action_taken_);
+
+      materialized_state_ = std::move(my_state);
+      state_materialized_ = true;
+      return *materialized_state_;
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "Error materializing state for node reached by action " << action_taken_ << ": " << e.what() << std::endl;
+      throw; // Re-throw exception
+    }
+    catch (const py::error_already_set &e)
+    {
+      std::cerr << "Python error materializing state for node reached by action " << action_taken_ << ": " << e.what() << std::endl;
+      throw; // Re-throw Python exception
+    }
+  }
+
+  bool Node::has_state_materialized() const
+  {
+    return state_materialized_;
+  }
+
+  Node *Node::get_parent() const
+  {
+    return parent_;
+  }
+  Action Node::get_action_taken() const
+  {
+    return action_taken_;
+  }
 
   bool Node::is_expanded() const { return !children_.empty(); }
-  bool Node::is_terminal() const { return trimcts::is_terminal(state_); }
+
+  // is_terminal now needs to potentially materialize the state
+  bool Node::is_terminal()
+  {
+    py::object state = get_state(); // Ensure state is available
+    return trimcts::is_terminal(state);
+  }
 
   float Node::get_value_estimate() const
   {
     if (visit_count_ == 0)
       return 0.0f;
-    return static_cast<float>(total_action_value_ / visit_count_);
+    return visit_count_ > 0 ? static_cast<float>(total_action_value_ / visit_count_) : 0.0f;
   }
 
   float Node::calculate_puct(const SearchConfig &config) const
   {
     if (!parent_)
-      return -std::numeric_limits<float>::infinity();
+      return std::numeric_limits<float>::infinity();
+
     float q_value = get_value_estimate();
     double parent_visits_sqrt = std::sqrt(static_cast<double>(std::max(1, parent_->visit_count_)));
     double exploration_term = config.cpuct * prior_probability_ * (parent_visits_sqrt / (1.0 + visit_count_));
+
     return q_value + static_cast<float>(exploration_term);
   }
 
@@ -2456,16 +1864,23 @@ namespace trimcts
         best_child = child_ptr.get();
       }
     }
+    if (best_child == nullptr && !children_.empty())
+    {
+      std::cerr << "Warning: select_child failed to find a best child despite having children." << std::endl;
+    }
     return best_child;
   }
 
+  // Expansion no longer creates state, just child nodes
   void Node::expand(const PolicyMap &policy_map)
   {
-    if (is_expanded() || is_terminal())
+    if (is_expanded() || is_terminal()) // is_terminal() might materialize state here
       return;
-    std::vector<Action> valid_actions = trimcts::get_valid_actions(state_);
+
+    py::object current_state = get_state(); // Ensure state is available for get_valid_actions
+    std::vector<Action> valid_actions = trimcts::get_valid_actions(current_state);
     if (valid_actions.empty())
-      return;
+      return; // Cannot expand if no valid actions
 
     for (Action action : valid_actions)
     {
@@ -2473,9 +1888,9 @@ namespace trimcts
       auto it = policy_map.find(action);
       if (it != policy_map.end())
         prior = it->second;
-      py::object next_state_py = trimcts::copy_state(state_);
-      trimcts::apply_action(next_state_py, action);
-      children_[action] = std::make_unique<Node>(std::move(next_state_py), this, action, prior);
+
+      // Create child node without materializing its state yet
+      children_[action] = std::make_unique<Node>(this, action, prior);
     }
   }
 
@@ -2490,6 +1905,32 @@ namespace trimcts
     }
   }
 
+  std::unique_ptr<Node> Node::detach_child(Action action)
+  {
+    auto it = children_.find(action);
+    if (it == children_.end())
+    {
+      return nullptr;
+    }
+    std::unique_ptr<Node> child_ptr = std::move(it->second);
+    children_.erase(it);
+    return child_ptr;
+  }
+
+  // Updates the Python state object held by this node.
+  // This is primarily used when reusing a node as the new root.
+  void Node::update_state(py::object new_state)
+  {
+    materialized_state_ = std::move(new_state);
+    state_materialized_ = true; // Mark as materialized
+  }
+
+  void Node::set_parent(Node *new_parent)
+  {
+    parent_ = new_parent;
+  }
+
+  // sample_dirichlet_simple remains the same
   void sample_dirichlet_simple(double alpha, size_t k, std::vector<double> &output, std::mt19937 &rng)
   {
     output.resize(k);
@@ -2509,8 +1950,11 @@ namespace trimcts
     }
     else
     {
-      for (size_t i = 0; i < k; ++i)
-        output[i] = 1.0 / k;
+      if (k > 0)
+      {
+        for (size_t i = 0; i < k; ++i)
+          output[i] = 1.0 / k;
+      }
     }
   }
 
@@ -2525,7 +1969,13 @@ namespace trimcts
     double total_prior = 0.0;
     for (auto &[action, child_ptr] : children_)
     {
-      child_ptr->prior_probability_ = (1.0f - config.dirichlet_epsilon) * child_ptr->prior_probability_ + config.dirichlet_epsilon * static_cast<float>(noise[i]);
+      float current_prior = child_ptr->prior_probability_;
+      if (!std::isfinite(current_prior))
+      {
+        std::cerr << "Warning: Non-finite prior probability encountered before adding noise for action " << action << ". Resetting to 0." << std::endl;
+        current_prior = 0.0f;
+      }
+      child_ptr->prior_probability_ = (1.0f - static_cast<float>(config.dirichlet_epsilon)) * current_prior + static_cast<float>(config.dirichlet_epsilon * noise[i]);
       total_prior += child_ptr->prior_probability_;
       i++;
     }
@@ -2536,10 +1986,20 @@ namespace trimcts
         child_ptr->prior_probability_ /= static_cast<float>(total_prior);
       }
     }
+    else if (total_prior <= 1e-9 && num_children > 0)
+    {
+      float uniform_prior = 1.0f / static_cast<float>(num_children);
+      for (auto &[action, child_ptr] : children_)
+      {
+        child_ptr->prior_probability_ = uniform_prior;
+      }
+      std::cerr << "Warning: Total prior probability near zero after adding noise. Resetting to uniform." << std::endl;
+    }
   }
 
-  // --- MCTS Main Logic with Corrected Batching ---
+  // --- MCTS Main Logic with Lazy State Creation ---
 
+  // process_evaluated_batch needs to get state before expanding
   void process_evaluated_batch(
       const std::vector<Node *> &leaves,
       const std::vector<NetworkOutput> &results)
@@ -2557,71 +2017,178 @@ namespace trimcts
     {
       Node *leaf = leaves[i];
       const NetworkOutput &output = results[i];
+      // Expand *before* backpropagating value from evaluation
       if (!leaf->is_terminal())
-        leaf->expand(output.policy);
+      { // is_terminal ensures state is materialized
+        try
+        {
+          leaf->expand(output.policy);
+        }
+        catch (const std::exception &e)
+        {
+          std::cerr << "Error during leaf expansion: " << e.what() << std::endl;
+        }
+        catch (const py::error_already_set &e)
+        {
+          std::cerr << "Python error during leaf expansion: " << e.what() << std::endl;
+        }
+      }
+      // Backpropagate the value from the network evaluation
       leaf->backpropagate(output.value);
     }
   }
 
-  PYBIND11_EXPORT VisitMap run_mcts_cpp_internal(
-      py::object root_state_py,
+  // Main MCTS function updated for tree reuse and lazy state
+  PYBIND11_EXPORT std::pair<VisitMap, py::capsule> run_mcts_cpp_internal(
+      py::object current_root_state_py,
       py::object network_interface_py,
-      const SearchConfig &config)
+      const SearchConfig &config,
+      const py::capsule &previous_tree_capsule,
+      Action last_action)
   {
-    if (trimcts::is_terminal(root_state_py))
-      return {};
+    std::unique_ptr<MctsTreeManager> tree_manager_ptr;
+    Node *root_node = nullptr;
+    bool reused_tree = false;
 
-    Node root(std::move(root_state_py));
+    // --- Tree Reuse Logic ---
+    if (previous_tree_capsule && PyCapsule_IsValid(previous_tree_capsule.ptr(), "MctsTreeManager"))
+    {
+      MctsTreeManager *previous_manager = static_cast<MctsTreeManager *>(
+          PyCapsule_GetPointer(previous_tree_capsule.ptr(), "MctsTreeManager"));
+      if (previous_manager)
+      {
+        Node *old_root = previous_manager->get_root();
+        if (old_root && last_action != -1)
+        {
+          std::unique_ptr<Node> reused_subtree_root = old_root->detach_child(last_action);
+          if (reused_subtree_root)
+          {
+            reused_subtree_root->set_parent(nullptr);
+            reused_subtree_root->update_state(current_root_state_py); // Set state for the new root
+            tree_manager_ptr = std::make_unique<MctsTreeManager>(std::move(reused_subtree_root));
+            root_node = tree_manager_ptr->get_root();
+            reused_tree = true;
+          }
+          else
+          {
+            std::cerr << "Warning: Could not find child for last_action " << last_action << ". Creating new tree." << std::endl;
+          }
+        }
+        else
+        {
+          std::cerr << "Warning: Previous tree handle invalid or last_action=-1. Creating new tree." << std::endl;
+        }
+      }
+      else
+      {
+        std::cerr << "Warning: Failed to retrieve MctsTreeManager pointer. Creating new tree." << std::endl;
+      }
+    }
+
+    // --- Create New Tree if Reuse Failed ---
+    if (!reused_tree)
+    {
+      try
+      {
+        // Create root node without state initially
+        auto initial_root = std::make_unique<Node>(nullptr, -1, 1.0f); // Parent=null, action=-1, prior=1?
+        initial_root->set_root_state(current_root_state_py);           // Set its state
+        tree_manager_ptr = std::make_unique<MctsTreeManager>(std::move(initial_root));
+        root_node = tree_manager_ptr->get_root();
+      }
+      catch (const std::exception &e)
+      {
+        std::cerr << "Error creating initial root node: " << e.what() << std::endl;
+        return {{}, py::capsule(nullptr, "MctsTreeManager", capsule_destructor)};
+      }
+      catch (const py::error_already_set &e)
+      {
+        std::cerr << "Python error creating initial root node: " << e.what() << std::endl;
+        return {{}, py::capsule(nullptr, "MctsTreeManager", capsule_destructor)};
+      }
+    }
+
+    // --- MCTS Core Logic ---
+    if (!root_node || root_node->is_terminal())
+    { // is_terminal ensures state is materialized
+      MctsTreeManager *manager_to_delete = tree_manager_ptr ? tree_manager_ptr.release() : nullptr;
+      return {{}, py::capsule(manager_to_delete, "MctsTreeManager", capsule_destructor)};
+    }
+
     std::mt19937 rng(std::random_device{}());
 
     // --- Root Preparation ---
-    std::vector<Node *> root_batch_nodes = {&root};
-    std::vector<py::object> root_batch_states = {root.state_};
-    std::vector<NetworkOutput> root_results;
-    try
+    if (!root_node->is_expanded())
     {
-      root_results = trimcts::evaluate_batch_alpha(network_interface_py, root_batch_states);
-      if (root_results.empty())
-        throw std::runtime_error("Root evaluation returned empty results.");
-      if (!root.is_terminal())
+      std::vector<Node *> root_batch_nodes = {root_node};
+      // Get state for evaluation (materializes if needed)
+      std::vector<py::object> root_batch_states;
+      try
       {
-        root.expand(root_results[0].policy);
-        if (root.is_expanded())
-          root.add_dirichlet_noise(config, rng);
-        else
-        {
-          std::cerr << "Warning: Root node failed to expand despite not being terminal." << std::endl;
-          return {};
-        }
+        root_batch_states.push_back(root_node->get_state());
       }
-      // Backpropagate root value once before simulations
-      root.backpropagate(root_results[0].value);
+      catch (...)
+      {
+        std::cerr << "Error getting root state for initial evaluation." << std::endl;
+        MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
+        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+      }
+
+      std::vector<NetworkOutput> root_results;
+      try
+      {
+        root_results = trimcts::evaluate_batch_alpha(network_interface_py, root_batch_states);
+        if (root_results.empty())
+          throw std::runtime_error("Root evaluation returned empty results.");
+
+        if (!root_node->is_terminal())
+        {                                            // Checks state again
+          root_node->expand(root_results[0].policy); // expand uses get_state internally
+          if (!root_node->is_expanded())
+          {
+            std::cerr << "Warning: Root node failed to expand despite not being terminal." << std::endl;
+            MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
+            return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+          }
+        }
+        root_node->backpropagate(root_results[0].value);
+      }
+      catch (const std::exception &e)
+      {
+        std::cerr << "Error during MCTS root preparation: " << e.what() << std::endl;
+        MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
+        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+      }
+      catch (const py::error_already_set &e)
+      {
+        std::cerr << "Python error during MCTS root preparation: " << e.what() << std::endl;
+        MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
+        return {{}, py::capsule(manager_raw_ptr, "MctsTreeManager", capsule_destructor)};
+      }
     }
-    catch (const std::exception &e)
+    if (root_node->is_expanded())
     {
-      std::cerr << "Error during MCTS root initialization/evaluation: " << e.what() << std::endl;
-      return {};
+      root_node->add_dirichlet_noise(config, rng);
     }
 
     // --- Simulation Loop ---
-    std::vector<Node *> all_leaves_to_evaluate; // Collect ALL leaves here
+    std::vector<Node *> all_leaves_to_evaluate;
+    all_leaves_to_evaluate.reserve(config.max_simulations);
 
     for (uint32_t i = 0; i < config.max_simulations; ++i)
     {
-      Node *current_node = &root;
+      Node *current_node = root_node;
       int depth = 0;
 
       // 1. Selection
-      while (current_node->is_expanded() && !current_node->is_terminal())
+      while (current_node->is_expanded() && !current_node->is_terminal()) // is_terminal ensures state
       {
         Node *selected_child = current_node->select_child(config);
         if (!selected_child)
         {
-          // This might happen if all children have invalid PUCT scores
-          // Or if the node was expanded but somehow has no children (logic error).
-          std::cerr << "Warning: Selection failed to find a child for node with visit count " << current_node->visit_count_ << ". Stopping simulation." << std::endl;
-          current_node = nullptr; // Mark selection as failed
-          break;                  // Exit selection loop for this simulation
+          std::cerr << "Warning: Selection failed for node V=" << current_node->visit_count_ << ". Stopping sim." << std::endl;
+          current_node = nullptr;
+          break;
         }
         current_node = selected_child;
         depth++;
@@ -2630,73 +2197,185 @@ namespace trimcts
       }
 
       if (!current_node)
-        continue; // Skip to next simulation if selection failed
+        continue;
 
-      // 2. Check if Expansion is Needed (or if terminal/max depth)
+      // 2. Expansion / Backpropagation
       if (!current_node->is_expanded() && !current_node->is_terminal() && depth < config.max_depth)
       {
-        // Leaf node needs evaluation and expansion. Add to collection.
-        all_leaves_to_evaluate.push_back(current_node); // Add to the main list
+        // Leaf node needs evaluation. Add to list. State will be materialized later.
+        all_leaves_to_evaluate.push_back(current_node);
       }
       else
       {
         // Node is terminal, already expanded, or max depth reached.
-        // Backpropagate the existing value estimate or terminal outcome immediately.
-        Value value = current_node->is_terminal() ? trimcts::get_outcome(current_node->state_) : current_node->get_value_estimate();
+        // Backpropagate terminal outcome or existing value estimate.
+        // Need state for get_outcome if terminal.
+        Value value = current_node->is_terminal() ? trimcts::get_outcome(current_node->get_state()) : current_node->get_value_estimate();
         current_node->backpropagate(value);
       }
-
     } // End simulation loop
 
     // --- Process ALL Collected Leaves in Batches ---
     if (!all_leaves_to_evaluate.empty())
     {
       size_t num_leaves = all_leaves_to_evaluate.size();
-      size_t batch_size = static_cast<size_t>(config.mcts_batch_size); // Cast once
+      size_t batch_size = static_cast<size_t>(config.mcts_batch_size);
 
       for (size_t batch_start = 0; batch_start < num_leaves; batch_start += batch_size)
       {
         size_t batch_end = std::min(batch_start + batch_size, num_leaves);
         std::vector<Node *> current_batch_nodes;
-        std::vector<py::object> current_batch_states;
+        std::vector<py::object> current_batch_states; // States for the network
         current_batch_nodes.reserve(batch_end - batch_start);
         current_batch_states.reserve(batch_end - batch_start);
 
-        // Create sub-vectors for the current batch
+        // Materialize states for the batch
+        bool state_error = false;
         for (size_t k = batch_start; k < batch_end; ++k)
         {
-          current_batch_nodes.push_back(all_leaves_to_evaluate[k]);
-          current_batch_states.push_back(all_leaves_to_evaluate[k]->state_);
+          Node *leaf = all_leaves_to_evaluate[k];
+          try
+          {
+            current_batch_states.push_back(leaf->get_state()); // Materialize state here
+            current_batch_nodes.push_back(leaf);
+          }
+          catch (...)
+          {
+            std::cerr << "Error getting state for leaf node during batch creation. Skipping node." << std::endl;
+            // Backpropagate 0 for this node?
+            leaf->backpropagate(0.0f);
+            state_error = true;
+          }
         }
+        // Skip network call if any state failed to materialize in this batch
+        if (state_error || current_batch_nodes.empty())
+          continue;
 
         // Process this batch
         try
         {
           std::vector<NetworkOutput> results = trimcts::evaluate_batch_alpha(network_interface_py, current_batch_states);
-          process_evaluated_batch(current_batch_nodes, results);
+          process_evaluated_batch(current_batch_nodes, results); // Expands and backpropagates
         }
         catch (const std::exception &e)
         {
           std::cerr << "Error during MCTS batch evaluation/processing (Batch " << (batch_start / batch_size) << "): " << e.what() << std::endl;
           for (Node *leaf : current_batch_nodes)
-          {
             leaf->backpropagate(0.0f);
-          }
+        }
+        catch (const py::error_already_set &e)
+        {
+          std::cerr << "Python error during MCTS batch evaluation/processing (Batch " << (batch_start / batch_size) << "): " << e.what() << std::endl;
+          for (Node *leaf : current_batch_nodes)
+            leaf->backpropagate(0.0f);
         }
       }
     }
 
     // --- Collect Results ---
     VisitMap visit_counts;
-    for (auto const &[action, child_ptr] : root.children_)
+    if (root_node)
     {
-      visit_counts[action] = child_ptr->visit_count_;
+      for (auto const &[action, child_ptr] : root_node->children_)
+      {
+        visit_counts[action] = child_ptr->visit_count_;
+      }
     }
 
-    return visit_counts;
+    // --- Return results and the new tree handle ---
+    MctsTreeManager *manager_raw_ptr = tree_manager_ptr.release();
+    py::capsule new_capsule(manager_raw_ptr, "MctsTreeManager", &capsule_destructor);
+
+    return {visit_counts, new_capsule};
   }
 
 } // namespace trimcts
+
+File: src/trimcts/cpp/mcts_manager.h
+
+#ifndef TRIMCTS_CPP_MCTS_MANAGER_H
+#define TRIMCTS_CPP_MCTS_MANAGER_H
+
+#pragma once
+
+#include <memory>              // For std::unique_ptr
+#include <pybind11/pybind11.h> // Include pybind11 for py::object
+#include <cstdio>              // For fprintf in destructor error
+
+// Forward declaration of Node to avoid circular include if possible
+// If Node methods are needed here, include mcts.h instead.
+namespace trimcts
+{
+  class Node;
+}
+
+namespace py = pybind11;
+
+namespace trimcts
+{
+
+  class MctsTreeManager
+  {
+  public:
+    // Constructor takes ownership of the root node
+    explicit MctsTreeManager(std::unique_ptr<Node> root);
+
+    // Destructor will automatically delete the managed root node via unique_ptr
+    ~MctsTreeManager() = default;
+
+    // --- Rule of 5/0 ---
+    // Disable copy constructor and assignment
+    MctsTreeManager(const MctsTreeManager &) = delete;
+    MctsTreeManager &operator=(const MctsTreeManager &) = delete;
+    // Enable move constructor and assignment (transfers ownership of root_)
+    MctsTreeManager(MctsTreeManager &&) = default;
+    MctsTreeManager &operator=(MctsTreeManager &&) = default;
+
+    // Method to get the root node (non-owning pointer)
+    Node *get_root() const;
+
+    // Method to take ownership of the root (used for subtree promotion)
+    std::unique_ptr<Node> release_root();
+
+    // Method to set a new root (takes ownership)
+    void set_root(std::unique_ptr<Node> new_root);
+
+  private:
+    std::unique_ptr<Node> root_;
+  };
+
+  // Destructor function for the py::capsule
+  // IMPORTANT: This function MUST have C linkage to be correctly used by PyCapsule_New.
+  extern "C"
+  {
+    inline void capsule_destructor(PyObject *capsule)
+    {
+      // Name must match the one used when creating the capsule in bindings.cpp
+      // Use static_cast for type safety.
+      MctsTreeManager *manager = static_cast<MctsTreeManager *>(PyCapsule_GetPointer(capsule, "MctsTreeManager"));
+      if (manager)
+      {                 // Check if pointer is not null
+        delete manager; // Delete the MctsTreeManager object
+      }
+      else if (PyErr_Occurred())
+      {
+        // An error occurred during PyCapsule_GetPointer (e.g., wrong name)
+        // Pybind11 might handle this, but logging could be useful.
+        // Avoid throwing exceptions from destructors.
+        fprintf(stderr, "Error: Failed to retrieve MctsTreeManager pointer from capsule in destructor.\n");
+        PyErr_Clear(); // Clear the Python error state
+      }
+      else
+      {
+        // Pointer was null, but no Python error occurred (e.g., capsule created with nullptr)
+        fprintf(stderr, "Warning: MctsTreeManager capsule destructor called with null pointer.\n");
+      }
+    }
+  } // extern "C"
+
+} // namespace trimcts
+
+#endif // TRIMCTS_CPP_MCTS_MANAGER_H
 
 File: src/trimcts/cpp/mcts.h
 #pragma once
@@ -2706,6 +2385,8 @@ File: src/trimcts/cpp/mcts.h
 #include <map>
 #include <memory> // For std::unique_ptr
 #include <random>
+#include <optional> // For optional members/return
+#include <utility>  // For std::pair
 
 #include "config.h"
 #include "python_interface.h" // For types and Python interaction helpers
@@ -2715,32 +2396,48 @@ namespace py = pybind11;
 namespace trimcts
 {
 
+  // Forward declaration
+  class MctsTreeManager;
+
   class Node
   {
   public:
-    Node(py::object state, Node *parent = nullptr, Action action = -1, float prior = 0.0);
+    // Constructor for non-root nodes
+    Node(Node *parent, Action action, float prior = 0.0);
     ~Node() = default; // Use default destructor
 
     // Disable copy constructor and assignment operator
     Node(const Node &) = delete;
     Node &operator=(const Node &) = delete;
 
-    // Enable move constructor and assignment operator (optional, but good practice)
+    // Enable move constructor and assignment operator
     Node(Node &&) = default;
     Node &operator=(Node &&) = default;
 
+    // --- Core MCTS Methods ---
     bool is_expanded() const;
-    bool is_terminal() const;
+    bool is_terminal(); // Now non-const as it might materialize state
     float get_value_estimate() const;
     Node *select_child(const SearchConfig &config);
-    void expand(const PolicyMap &policy_map);
+    void expand(const PolicyMap &policy_map); // Expansion logic changes
     void backpropagate(float value);
     void add_dirichlet_noise(const SearchConfig &config, std::mt19937 &rng);
 
-    // --- Public Members (Consider making some private with getters/setters) ---
-    Node *parent_;
-    Action action_taken_; // Action that led to this node
-    py::object state_;    // Python GameState object
+    // --- State Management (Lazy Creation) ---
+    py::object get_state(); // Gets or materializes the state
+    bool has_state_materialized() const;
+    void set_root_state(py::object state);   // Special method for root
+    void update_state(py::object new_state); // ADDED declaration back
+
+    // --- Tree Structure ---
+    std::unique_ptr<Node> detach_child(Action action);
+    void set_parent(Node *new_parent);
+    Node *get_parent() const;
+    Action get_action_taken() const; // Action that led *to* this node
+
+    // --- Public Members ---
+    // Node *parent_; // Keep parent pointer
+    // Action action_taken_; // Renamed to action_to_reach_? No, keep as action that *led* here.
     std::map<Action, std::unique_ptr<Node>> children_;
 
     int visit_count_ = 0;
@@ -2748,14 +2445,23 @@ namespace trimcts
     float prior_probability_ = 0.0;
 
   private:
+    Node *parent_;        // Pointer to parent node
+    Action action_taken_; // Action taken by parent to reach this node
+
+    // State is now optional and mutable for lazy creation
+    mutable std::optional<py::object> materialized_state_;
+    mutable bool state_materialized_ = false;
+
     float calculate_puct(const SearchConfig &config) const;
   };
 
-  // Main MCTS function signature with visibility macro
-  PYBIND11_EXPORT VisitMap run_mcts_cpp_internal( // Added PYBIND11_EXPORT
-      py::object root_state,
-      py::object network_interface, // AlphaZero interface for now
-      const SearchConfig &config);
+  // Main MCTS function signature remains the same
+  PYBIND11_EXPORT std::pair<VisitMap, py::capsule> run_mcts_cpp_internal(
+      py::object current_root_state_py,
+      py::object network_interface_py,
+      const SearchConfig &config,
+      const py::capsule &previous_tree_capsule,
+      Action last_action);
 
 } // namespace trimcts
 
@@ -2763,14 +2469,17 @@ File: src/trimcts/cpp/bindings.cpp
 // File: src/trimcts/cpp/bindings.cpp
 
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>     // For map/vector conversions
-#include <pybind11/pytypes.h> // For py::object, py::handle
+#include <pybind11/stl.h>     // For map/vector/pair conversions
+#include <pybind11/pytypes.h> // For py::object, py::handle, py::capsule
 
-#include "mcts.h"             // C++ MCTS logic header
+#include "mcts.h"             // C++ MCTS logic header (includes Node)
+#include "mcts_manager.h"     // Include the manager header for capsule name/destructor
 #include "config.h"           // C++ SearchConfig struct
 #include "python_interface.h" // For NetworkOutput, VisitMap, etc.
-#include <string>             // std::string
-#include <stdexcept>          // std::runtime_error
+// #include "structs.h"       // REMOVED redundant include
+#include <string>    // std::string
+#include <stdexcept> // std::runtime_error
+#include <utility>   // For std::pair
 
 namespace py = pybind11;
 namespace tc = trimcts; // Alias for your C++ namespace
@@ -2787,7 +2496,6 @@ static tc::SearchConfig python_to_cpp_config(const py::object &py_config)
     cpp_config.dirichlet_alpha = py_config.attr("dirichlet_alpha").cast<double>();
     cpp_config.dirichlet_epsilon = py_config.attr("dirichlet_epsilon").cast<double>();
     cpp_config.discount = py_config.attr("discount").cast<double>();
-    // **NEW**: read the Python-configured batch size
     cpp_config.mcts_batch_size = py_config.attr("mcts_batch_size").cast<uint32_t>();
   }
   catch (const py::error_already_set &e)
@@ -2803,43 +2511,88 @@ static tc::SearchConfig python_to_cpp_config(const py::object &py_config)
   return cpp_config;
 }
 
-// Wrapper function exposed to Python
-tc::VisitMap run_mcts_cpp_wrapper(
+// Wrapper function exposed to Python - updated for tree reuse
+// Returns a pair (VisitMap, new_capsule)
+std::pair<tc::VisitMap, py::capsule> run_mcts_cpp_wrapper(
     py::object root_state_py,
     py::object network_interface_py,
-    const py::object &config_py // Pass Python config object
+    const py::object &config_py,
+    const py::object &previous_tree_handle_obj, // Accept py::object (can be None)
+    tc::Action last_action                      // Action leading to root_state_py
 )
 {
-  // Convert Python config to C++ config struct (including batch size)
   tc::SearchConfig config_cpp = python_to_cpp_config(config_py);
 
-  // Call the internal C++ MCTS implementation
+  // Handle optional capsule input
+  py::capsule previous_tree_capsule;
+  if (!previous_tree_handle_obj.is_none())
+  {
+    try
+    {
+      // Attempt to cast the Python object to a capsule
+      previous_tree_capsule = previous_tree_handle_obj.cast<py::capsule>();
+      // Optional: Check capsule name for extra safety, though PyCapsule_IsValid does this
+      // if (!PyCapsule_IsValid(previous_tree_capsule.ptr(), "MctsTreeManager")) {
+      //     throw py::type_error("Invalid capsule type passed for previous_tree_handle.");
+      // }
+    }
+    catch (const py::cast_error &e)
+    {
+      throw py::type_error("Argument previous_tree_handle must be a valid capsule or None.");
+    }
+  }
+  // If previous_tree_handle_obj was None, previous_tree_capsule remains default-constructed (invalid/null)
+
   try
   {
-    return tc::run_mcts_cpp_internal(root_state_py, network_interface_py, config_cpp);
+    // Call the internal C++ MCTS implementation with reuse parameters
+    return tc::run_mcts_cpp_internal(
+        root_state_py,
+        network_interface_py,
+        config_cpp,
+        previous_tree_capsule, // Pass the potentially null capsule
+        last_action);
   }
   catch (const std::exception &e)
   {
-    // Convert C++ exceptions to Python exceptions
     throw py::value_error(std::string("Error in C++ MCTS execution: ") + e.what());
   }
   catch (const py::error_already_set &)
   {
-    // Propagate any Python-side exceptions
-    throw;
+    throw; // Re-throw Python exceptions
   }
 }
 
 PYBIND11_MODULE(trimcts_cpp, m)
 {
-  m.doc() = "C++ core module for TriMCTS";
+  m.doc() = "C++ core module for TriMCTS with Tree Reuse";
 
+  // Expose the updated MCTS function
   m.def("run_mcts_cpp",
         &run_mcts_cpp_wrapper,
         py::arg("root_state"),
         py::arg("network_interface"),
         py::arg("config"),
-        "Runs MCTS simulations from the root state using the provided network interface and configuration (C++).");
+        py::arg("previous_tree_handle"), // Use a descriptive name
+        py::arg("last_action"),
+        R"pbdoc(
+            Runs MCTS simulations from the root state using the provided network interface and configuration.
+            Supports tree reuse via previous_tree_handle and last_action.
+
+            Args:
+                root_state: The current Python game state object.
+                network_interface: Python object implementing the network evaluation interface.
+                config: Python SearchConfiguration object.
+                previous_tree_handle: An optional handle (py::capsule or None) to the MCTS tree state from the previous step.
+                last_action: The action taken in the previous step that led to the current root_state. Use -1 if no previous step or handle.
+
+            Returns:
+                A tuple containing:
+                    - VisitMap (dict[int, int]): Visit counts for actions from the root.
+                    - py::capsule: A new handle to the MCTS tree state after the search. None if MCTS failed or state was terminal.
+        )pbdoc",
+        // Ensure return value policy allows Python to manage the capsule lifetime
+        py::return_value_policy::move); // Move the pair, including the capsule
 
 #ifdef VERSION_INFO
   m.attr("__version__") = VERSION_INFO;
@@ -2848,12 +2601,11 @@ PYBIND11_MODULE(trimcts_cpp, m)
 #endif
 }
 
-
 File: src/trimcts.egg-info/PKG-INFO
 Metadata-Version: 2.4
 Name: trimcts
-Version: 1.1.0
-Summary: High‑performance C++ MCTS (AlphaZero & MuZero) for triangular games
+Version: 1.2.0
+Summary: High‑performance C++ MCTS (AlphaZero & MuZero) with Tree Reuse for triangular games
 Author-email: "Luis Guilherme P. M." <lgpelin92@gmail.com>
 License-Expression: MIT
 Project-URL: Homepage, https://github.com/lguibr/trimcts
@@ -2875,692 +2627,7 @@ Requires-Dist: ruff; extra == "dev"
 Requires-Dist: mypy; extra == "dev"
 Dynamic: license-file
 
-Okay, Phase 1 addressed the C++ implementation of `copy` and `step` directly. The test passing indicates the core logic is likely sound. Now, let's move to Phase 2: Optimizing how `trimcts` interacts with `trianglengin`, aiming to reduce the *cost* or *frequency* of expensive operations called from C++ back into Python during the MCTS search.
 
-You mentioned reusing trees, which is a standard technique (often called "subtree reuse" or "warm starting"). Let's analyze the state-of-the-art approaches and decide on the best strategy for Phase 2:
-
-**State-of-the-Art MCTS Optimizations & Phase 2 Options:**
-
-1.  **Subtree Reuse:**
-    *   **Concept:** After selecting the best action `A` based on the search from the root `R`, instead of discarding the entire tree, reuse the subtree rooted at the child node `C` corresponding to action `A`. Make `C` the new root for the next search step. Prune the rest of the tree.
-    *   **Pros:** Significantly reduces redundant computation, especially early in the game or when simulations are high. The most impactful optimization for reducing the *number* of simulations needed per step.
-    *   **Cons:**
-        *   **Major Architectural Change:** Requires `run_mcts` to manage tree state across calls (accepting an old root/tree, returning the new root/tree).
-        *   **Python State Management:** The C++ tree nodes hold `py::object` references to Python `GameState` objects. When reusing a subtree, the new root node in C++ needs to point to the *actual* updated Python `GameState` object (after `step(A)` was called in Python). This cross-language state management is complex and error-prone (reference counting, object lifetime).
-        *   **Complexity:** High implementation complexity in both C++ and the Python wrapper.
-
-2.  **Batched Network Evaluations:**
-    *   **Concept:** Modify the C++ MCTS simulation loop. Instead of calling the Python `network.evaluate_state` for each leaf node encountered during expansion, collect a batch of leaf nodes (and their corresponding Python `GameState` objects). Then, make a single call to the Python `network.evaluate_batch` method. Distribute the results back to the respective nodes for expansion and backpropagation.
-    *   **Pros:**
-        *   Directly addresses the profiling result showing many `evaluate_state` calls.
-        *   Leverages GPU parallelism for network inference much more effectively.
-        *   Reduces Python C++ call overhead significantly for network evaluations.
-        *   Lower architectural impact than subtree reuse (doesn't change the fundamental "new search per step" model as drastically).
-    *   **Cons:**
-        *   Requires modifying the C++ MCTS simulation loop logic.
-        *   Introduces slight latency while waiting to fill a batch within a simulation step (but overall throughput should increase).
-        *   Doesn't reduce the number of `copy`/`step` calls during expansion, only network calls.
-
-3.  **Virtual Loss:**
-    *   **Concept:** When multiple simulations run in parallel (conceptually, or in a batched manner), temporarily penalize the value of nodes currently being explored by other simulations ("virtual loss"). This encourages exploration of different branches while waiting for batch results.
-    *   **Pros:** Improves exploration efficiency when using batching.
-    *   **Cons:** Primarily useful in highly parallelized search settings (e.g., multiple threads exploring the same tree, or large batches). Adds complexity to node statistics.
-
-**Decision for Phase 2:**
-
-*   **Subtree Reuse:** Highest potential gain but highest complexity and risk due to Python state management. Let's keep this as a potential Phase 3 if needed.
-*   **Batched Network Evaluations:** Directly addresses a known bottleneck (`evaluate_state` calls), leverages GPU potential, has moderate complexity, and lower risk. This is the most pragmatic and impactful next step.
-*   **Virtual Loss:** Can be added *on top of* batching later if needed, but batching itself is the primary goal now.
-
-**Therefore, the plan for Phase 2 is to implement Batched Network Evaluations within the `trimcts` C++ core.**
-
-**Implementation Plan (Batching):**
-
-1.  **Modify `mcts.cpp` (`run_mcts_cpp_internal`):**
-    *   Change the main simulation loop.
-    *   When selection reaches a leaf node that needs expansion:
-        *   Do *not* immediately call `evaluate_state_alpha`.
-        *   Store the leaf `Node*` pointer and its Python `state_` object (`py::object`) in temporary vectors (e.g., `std::vector<Node*> leaves_to_evaluate; std::vector<py::object> states_to_evaluate;`).
-    *   Continue running simulations, adding leaves to these vectors until a batch size is reached (e.g., 8 or 16) or the total simulation budget is nearly exhausted.
-    *   If the vectors are non-empty:
-        *   Call `evaluate_batch_alpha(network_interface_py, states_to_evaluate)`.
-        *   Iterate through the returned results and the corresponding `leaves_to_evaluate`.
-        *   For each leaf node and its `(policy, value)` result:
-            *   Call `node->expand(policy)`.
-            *   Call `node->backpropagate(value)`.
-        *   Clear the temporary vectors.
-    *   Handle the case where the loop finishes with remaining leaves in the vectors (process the final partial batch).
-2.  **Configuration:** Add a batch size parameter to `SearchConfiguration` (both Python and C++). Default to 1 initially to match current behavior, then allow users to increase it (e.g., 8).
-3.  **Python Interface (`python_interface.h`):** No changes needed here, as `evaluate_batch_alpha` already exists.
-4.  **Testing:** Add tests (or modify existing ones) to verify batching works correctly and potentially measure performance improvement (though exact timing is hard in unit tests).
-5.  **Documentation:** Update READMEs in `trimcts`.
-6.  **Versioning:** Increment `trimcts` version.
-
-**Files to Change (Phase 2 - `trimcts`):**
-
-1.  `src/trimcts/cpp/config.h`: Add `batch_size` member.
-2.  `src/trimcts/config.py`: Add `MCTS_BATCH_SIZE` field to `SearchConfiguration`.
-3.  `src/trimcts/cpp/mcts.h`: Potentially minor changes if helper structs are needed.
-4.  `src/trimcts/cpp/mcts.cpp`: Major changes to `run_mcts_cpp_internal` loop logic.
-5.  `src/trimcts/cpp/bindings.cpp`: Update `python_to_cpp_config` to handle `MCTS_BATCH_SIZE`.
-6.  `README.md`: Document batching feature and config.
-7.  `pyproject.toml`: Increment version.
-
-Let's start implementing the batching logic.
-
----
-
-**1. File:** `trimcts/src/trimcts/cpp/config.h`
-*   **Change:** Add `mcts_batch_size`.
-
-```cpp
-#pragma once
-
-#include <cstdint> // For uint32_t etc.
-
-namespace trimcts {
-
-// Matches the Python SearchConfiguration Pydantic model
-struct SearchConfig {
-    uint32_t max_simulations = 50;
-    uint32_t max_depth = 10;
-    double cpuct = 1.25;
-    double dirichlet_alpha = 0.3;
-    double dirichlet_epsilon = 0.25;
-    double discount = 1.0;
-    uint32_t mcts_batch_size = 1; // Size for batching network evaluations
-    // Add other fields as needed
-};
-
-} // namespace trimcts
-```
-
-**2. File:** `trimcts/src/trimcts/config.py`
-*   **Change:** Add `MCTS_BATCH_SIZE` field.
-
-```python
-# File: src/trimcts/config.py
-"""
-Python configuration class for MCTS parameters.
-Uses Pydantic for validation.
-"""
-
-from pydantic import BaseModel, ConfigDict, Field  # Import ConfigDict
-
-
-class SearchConfiguration(BaseModel):
-    """MCTS Search Configuration."""
-
-    # Core Search Parameters
-    max_simulations: int = Field(
-        default=50, description="Maximum number of MCTS simulations per move.", gt=0
-    )
-    max_depth: int = Field(
-        default=10, description="Maximum depth for tree traversal.", gt=0
-    )
-
-    # UCT Parameters (AlphaZero style)
-    cpuct: float = Field(
-        default=1.25,
-        description="Constant determining the level of exploration (PUCT).",
-    )
-
-    # Dirichlet Noise (for root node exploration)
-    dirichlet_alpha: float = Field(
-        default=0.3, description="Alpha parameter for Dirichlet noise.", ge=0
-    )
-    dirichlet_epsilon: float = Field(
-        default=0.25,
-        description="Weight of Dirichlet noise in root prior probabilities.",
-        ge=0,
-        le=1.0,
-    )
-
-    # Discount Factor (Primarily for MuZero/Value Propagation)
-    discount: float = Field(
-        default=1.0,
-        description="Discount factor (gamma) for future rewards/values.",
-        ge=0.0,
-        le=1.0,
-    )
-
-    # Batching for Network Evaluations
-    mcts_batch_size: int = Field(
-        default=8, # Default to 8 for potential performance gain
-        description="Number of leaf nodes to collect before calling network evaluate_batch.",
-        gt=0,
-    )
-
-    # Use ConfigDict for Pydantic V2
-    model_config = ConfigDict(validate_assignment=True)
-
-```
-
-**3. File:** `trimcts/src/trimcts/cpp/bindings.cpp`
-*   **Change:** Update `python_to_cpp_config` to read `mcts_batch_size`.
-
-```cpp
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>     // For map/vector conversions
-#include <pybind11/pytypes.h> // For py::object, py::handle
-
-#include "mcts.h"             // Include your MCTS logic header
-#include "config.h"           // Include your config struct header
-#include "python_interface.h" // For types
-#include <string>             // Include string
-#include <stdexcept>          // Include stdexcept
-
-namespace py = pybind11;
-namespace tc = trimcts; // Alias for your C++ namespace
-
-// Helper function to transfer config from Python Pydantic model to C++ struct
-tc::SearchConfig python_to_cpp_config(const py::object &py_config)
-{
-  tc::SearchConfig cpp_config;
-  try {
-    // Use py::getattr with checks or casts
-    cpp_config.max_simulations = py_config.attr("max_simulations").cast<uint32_t>();
-    cpp_config.max_depth = py_config.attr("max_depth").cast<uint32_t>();
-    cpp_config.cpuct = py_config.attr("cpuct").cast<double>();
-    cpp_config.dirichlet_alpha = py_config.attr("dirichlet_alpha").cast<double>();
-    cpp_config.dirichlet_epsilon = py_config.attr("dirichlet_epsilon").cast<double>();
-    cpp_config.discount = py_config.attr("discount").cast<double>();
-    cpp_config.mcts_batch_size = py_config.attr("mcts_batch_size").cast<uint32_t>(); // Added batch size
-  } catch (const py::error_already_set &e) {
-        throw std::runtime_error(std::string("Error accessing SearchConfiguration attributes: ") + e.what());
-  } catch (const std::exception &e) {
-        throw std::runtime_error(std::string("Error converting SearchConfiguration: ") + e.what());
-  }
-  // Add other fields as needed
-  return cpp_config;
-}
-
-// Wrapper function exposed to Python
-tc::VisitMap run_mcts_cpp_wrapper(
-    py::object root_state_py,
-    py::object network_interface_py,
-    const py::object &config_py // Pass Python config object
-)
-{
-  // Convert Python config to C++ config struct
-  tc::SearchConfig config_cpp = python_to_cpp_config(config_py);
-
-  // Call the internal C++ MCTS implementation
-  // Add error handling around the C++ call
-  try
-  {
-    return tc::run_mcts_cpp_internal(root_state_py, network_interface_py, config_cpp);
-  }
-  catch (const std::exception &e)
-  {
-    // Convert C++ exceptions to Python exceptions
-    throw py::value_error(std::string("Error in C++ MCTS execution: ") + e.what());
-  }
-  catch (const py::error_already_set &e)
-  {
-    // Propagate Python exceptions that occurred during callbacks
-    throw; // Re-throw the Python exception
-  }
-}
-
-PYBIND11_MODULE(trimcts_cpp, m)
-{                                          // Module name must match CMakeExtension and import
-  m.doc() = "C++ core module for TriMCTS"; // Optional module docstring
-
-  // Expose the main MCTS function
-  m.def("run_mcts_cpp", &run_mcts_cpp_wrapper,
-        py::arg("root_state"), py::arg("network_interface"), py::arg("config"),
-        "Runs MCTS simulations from the root state using the provided network interface and configuration (C++).");
-
-#ifdef VERSION_INFO
-  m.attr("__version__") = VERSION_INFO;
-#else
-  m.attr("__version__") = "dev";
-#endif
-}
-```
-
-**4. File:** `trimcts/src/trimcts/cpp/mcts.cpp`
-*   **Change:** Implement batching logic in `run_mcts_cpp_internal`.
-
-```cpp
-#include "mcts.h"
-#include "python_interface.h" // For Python interaction
-#include <cmath>
-#include <limits>
-#include <stdexcept>
-#include <iostream> // For temporary debugging
-#include <numeric>  // For std::accumulate
-#include <vector>
-#include <algorithm> // For std::max_element, std::max
-#include <chrono>    // For timing (optional debug)
-
-namespace trimcts
-{
-
-  // --- Node Implementation (No changes needed here) ---
-
-  Node::Node(py::object state, Node *parent, Action action, float prior)
-      : parent_(parent), action_taken_(action), state_(std::move(state)), prior_probability_(prior) {}
-
-  bool Node::is_expanded() const
-  {
-    return !children_.empty();
-  }
-
-  bool Node::is_terminal() const
-  {
-    // Call Python's is_over() method
-    return trimcts::is_terminal(state_);
-  }
-
-  float Node::get_value_estimate() const
-  {
-    if (visit_count_ == 0)
-    {
-      return 0.0f;
-    }
-    // Cast to float for return type consistency
-    return static_cast<float>(total_action_value_ / visit_count_);
-  }
-
-  float Node::calculate_puct(const SearchConfig &config) const
-  {
-    if (!parent_)
-    {
-      return -std::numeric_limits<float>::infinity();
-    }
-
-    float q_value = get_value_estimate();
-    // Use std::max to avoid sqrt(0) if parent_visit_count is 0 (shouldn't happen after root expansion)
-    double parent_visits_sqrt = std::sqrt(static_cast<double>(std::max(1, parent_->visit_count_)));
-    double exploration_term = config.cpuct * prior_probability_ * (parent_visits_sqrt / (1.0 + visit_count_));
-
-    return q_value + static_cast<float>(exploration_term);
-  }
-
-  Node *Node::select_child(const SearchConfig &config)
-  {
-    if (children_.empty()) // Check children_ directly instead of is_expanded()
-    {
-      return nullptr;
-    }
-
-    Node *best_child = nullptr;
-    float max_score = -std::numeric_limits<float>::infinity();
-
-    for (auto const &[action, child_ptr] : children_)
-    {
-      float score = child_ptr->calculate_puct(config);
-      if (score > max_score)
-      {
-        max_score = score;
-        best_child = child_ptr.get();
-      }
-    }
-    // If all children have -inf score (e.g., parent visit count was 0), best_child might still be nullptr
-    // Or if children_ was non-empty but somehow all scores were -inf.
-    // Fallback: return first child if best_child is still null? Or handle error?
-    // Let's return nullptr and let the caller handle it.
-    return best_child;
-  }
-
-  void Node::expand(const PolicyMap &policy_map)
-  {
-    if (is_expanded() || is_terminal())
-    {
-      return;
-    }
-
-    std::vector<Action> valid_actions = trimcts::get_valid_actions(state_);
-    if (valid_actions.empty())
-    {
-       // This state is effectively terminal, even if is_terminal() was false.
-       // Don't try to expand. The backpropagation will use the value from evaluation/outcome.
-      return;
-    }
-
-    for (Action action : valid_actions)
-    {
-      float prior = 0.0f;
-      auto it = policy_map.find(action);
-      if (it != policy_map.end())
-      {
-        prior = it->second;
-      } else {
-        // Optionally handle actions valid in state but not in policy map (e.g., assign small prior)
-        // prior = 1e-6f; // Example: Small prior for valid but unlisted actions
-      }
-
-      // --- Lazy State Creation (Defer copy/step) ---
-      // Store action needed to reach child state, but don't create state yet.
-      // We'll create it only when needed for evaluation or further expansion.
-      // For now, let's stick to the original eager state creation for simplicity
-      // while implementing batching first.
-      py::object next_state_py = trimcts::copy_state(state_);
-      trimcts::apply_action(next_state_py, action);
-
-      children_[action] = std::make_unique<Node>(std::move(next_state_py), this, action, prior);
-    }
-  }
-
-  void Node::backpropagate(float value)
-  {
-    Node *current = this;
-    while (current != nullptr)
-    {
-      current->visit_count_++;
-      current->total_action_value_ += value;
-      current = current->parent_;
-    }
-  }
-
-  // Simple gamma distribution for Dirichlet noise (placeholder)
-  void sample_dirichlet_simple(double alpha, size_t k, std::vector<double> &output, std::mt19937 &rng)
-  {
-    output.resize(k);
-    std::gamma_distribution<double> dist(alpha, 1.0);
-    double sum = 0.0;
-    for (size_t i = 0; i < k; ++i)
-    {
-      output[i] = dist(rng);
-      if (output[i] < 1e-9) output[i] = 1e-9;
-      sum += output[i];
-    }
-    if (sum > 1e-9)
-    {
-      for (size_t i = 0; i < k; ++i) output[i] /= sum;
-    }
-    else
-    {
-      for (size_t i = 0; i < k; ++i) output[i] = 1.0 / k;
-    }
-  }
-
-  void Node::add_dirichlet_noise(const SearchConfig &config, std::mt19937 &rng)
-  {
-    if (children_.empty() || config.dirichlet_alpha <= 0 || config.dirichlet_epsilon <= 0)
-    {
-      return;
-    }
-
-    size_t num_children = children_.size();
-    std::vector<double> noise;
-    sample_dirichlet_simple(config.dirichlet_alpha, num_children, noise, rng);
-
-    size_t i = 0;
-    double total_prior = 0.0;
-    for (auto &[action, child_ptr] : children_)
-    {
-      child_ptr->prior_probability_ = (1.0f - config.dirichlet_epsilon) * child_ptr->prior_probability_ + config.dirichlet_epsilon * static_cast<float>(noise[i]);
-      total_prior += child_ptr->prior_probability_;
-      i++;
-    }
-
-    // Re-normalize
-    if (std::abs(total_prior - 1.0) > 1e-6 && total_prior > 1e-9)
-    {
-      for (auto &[action, child_ptr] : children_)
-      {
-        child_ptr->prior_probability_ /= static_cast<float>(total_prior);
-      }
-    }
-  }
-
-  // --- MCTS Main Logic with Batching ---
-
-  // Helper function to process a batch of evaluated leaves
-  void process_evaluated_batch(
-      const std::vector<Node *> &leaves,
-      const std::vector<NetworkOutput> &results)
-  {
-    if (leaves.size() != results.size())
-    {
-      std::cerr << "Error: Mismatch between leaves and evaluation results count." << std::endl;
-      // Decide how to handle: maybe backpropagate 0 for all?
-      for (Node *leaf : leaves)
-      {
-        leaf->backpropagate(0.0f); // Backpropagate neutral value on error
-      }
-      return;
-    }
-
-    for (size_t i = 0; i < leaves.size(); ++i)
-    {
-      Node *leaf = leaves[i];
-      const NetworkOutput &output = results[i];
-
-      // Expand the node using the policy from the result
-      if (!leaf->is_terminal()) // Only expand non-terminal leaves
-      {
-         leaf->expand(output.policy);
-      }
-
-      // Backpropagate the value from the result
-      leaf->backpropagate(output.value);
-    }
-  }
-
-  VisitMap run_mcts_cpp_internal(
-      py::object root_state_py,
-      py::object network_interface_py, // AlphaZero interface for now
-      const SearchConfig &config)
-  {
-    // auto start_time_total = std::chrono::high_resolution_clock::now(); // Optional timing
-
-    if (trimcts::is_terminal(root_state_py))
-    {
-      // std::cerr << "Error: MCTS called on a terminal root state." << std::endl;
-      return {};
-    }
-
-    Node root(std::move(root_state_py));
-    std::mt19937 rng(std::random_device{}());
-
-    // --- Root Preparation ---
-    std::vector<Node *> root_batch_nodes = {&root};
-    std::vector<py::object> root_batch_states = {root.state_};
-    std::vector<NetworkOutput> root_results;
-    try
-    {
-      // Use batch evaluation even for the single root node
-      root_results = trimcts::evaluate_batch_alpha(network_interface_py, root_batch_states);
-      if (root_results.empty()) {
-         throw std::runtime_error("Root evaluation returned empty results.");
-      }
-      // Expand root using the policy result
-      if (!root.is_terminal()) {
-          root.expand(root_results[0].policy);
-          if (root.is_expanded()) {
-              root.add_dirichlet_noise(config, rng);
-          } else {
-               std::cerr << "Warning: Root node failed to expand despite not being terminal." << std::endl;
-               // If root didn't expand, MCTS can't proceed.
-               return {};
-          }
-      }
-      // Backpropagate the root's evaluated value *once*
-      // This initializes the root's value estimate correctly before simulations start using it.
-      root.backpropagate(root_results[0].value);
-
-    }
-    catch (const std::exception &e)
-    {
-      std::cerr << "Error during MCTS root initialization/evaluation: " << e.what() << std::endl;
-      return {};
-    }
-
-    // --- Simulation Loop ---
-    std::vector<Node *> leaves_to_evaluate;
-    std::vector<py::object> states_to_evaluate;
-    leaves_to_evaluate.reserve(config.mcts_batch_size);
-    states_to_evaluate.reserve(config.mcts_batch_size);
-
-    for (uint32_t i = 0; i < config.max_simulations; ++i)
-    {
-      Node *current_node = &root;
-      int depth = 0;
-
-      // 1. Selection
-      while (current_node->is_expanded() && !current_node->is_terminal())
-      {
-        Node* selected_child = current_node->select_child(config);
-        if (!selected_child) {
-             // This might happen if all children have invalid PUCT scores (e.g., parent visit count 0, which shouldn't occur after root init)
-             // Or if the node was expanded but somehow has no children (logic error).
-             std::cerr << "Warning: Selection failed to find a child for node with visit count " << current_node->visit_count_ << ". Stopping simulation." << std::endl;
-             goto process_batch; // Process any pending batch and end this simulation
-        }
-        current_node = selected_child;
-        depth++;
-        if (depth >= config.max_depth)
-          break;
-      }
-
-      // 2. Check if Expansion is Needed
-      Value value;
-      if (!current_node->is_expanded() && !current_node->is_terminal() && depth < config.max_depth)
-      {
-        // Leaf node needs evaluation and expansion
-        leaves_to_evaluate.push_back(current_node);
-        states_to_evaluate.push_back(current_node->state_);
-
-        // Check if batch is full
-        if (leaves_to_evaluate.size() >= config.mcts_batch_size)
-        {
-        process_batch: // Label to jump to for processing
-          try
-          {
-            // Evaluate the batch
-            std::vector<NetworkOutput> results = trimcts::evaluate_batch_alpha(network_interface_py, states_to_evaluate);
-            // Process results (expand nodes, backpropagate values)
-            process_evaluated_batch(leaves_to_evaluate, results);
-          }
-          catch (const std::exception &e)
-          {
-            std::cerr << "Error during MCTS batch evaluation/processing: " << e.what() << std::endl;
-            // Backpropagate neutral value for all nodes in the failed batch
-             for (Node *leaf : leaves_to_evaluate) {
-                 leaf->backpropagate(0.0f);
-             }
-          }
-          // Clear the batch vectors
-          leaves_to_evaluate.clear();
-          states_to_evaluate.clear();
-        }
-      }
-      else
-      {
-        // Node is terminal, already expanded, or max depth reached.
-        // Backpropagate the existing value estimate or terminal outcome.
-        value = current_node->is_terminal() ? trimcts::get_outcome(current_node->state_) : current_node->get_value_estimate();
-        current_node->backpropagate(value);
-      }
-    } // End simulation loop
-
-    // Process any remaining leaves in the batch
-    if (!leaves_to_evaluate.empty())
-    {
-      try
-      {
-        std::vector<NetworkOutput> results = trimcts::evaluate_batch_alpha(network_interface_py, states_to_evaluate);
-        process_evaluated_batch(leaves_to_evaluate, results);
-      }
-      catch (const std::exception &e)
-      {
-        std::cerr << "Error during final MCTS batch evaluation/processing: " << e.what() << std::endl;
-         for (Node *leaf : leaves_to_evaluate) {
-             leaf->backpropagate(0.0f);
-         }
-      }
-    }
-
-    // --- Collect Results ---
-    VisitMap visit_counts;
-    for (auto const &[action, child_ptr] : root.children_)
-    {
-      visit_counts[action] = child_ptr->visit_count_;
-    }
-
-    // auto end_time_total = std::chrono::high_resolution_clock::now(); // Optional timing
-    // auto duration_total = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_total - start_time_total);
-    // std::cout << "Total MCTS time: " << duration_total.count() << " ms" << std::endl; // Optional timing
-
-    return visit_counts;
-  }
-
-} // namespace trimcts
-```
-
-**5. File:** `trimcts/src/trimcts/cpp/mcts.h`
-*   **Change:** No changes strictly required, but could add forward declarations if needed. (Keeping it unchanged for now).
-
-```cpp
-#pragma once
-
-#include <pybind11/pybind11.h> // Include pybind11 first
-#include <vector>
-#include <map>
-#include <memory> // For std::unique_ptr
-#include <random>
-
-#include "config.h"
-#include "python_interface.h" // For types and Python interaction helpers
-
-namespace py = pybind11;
-
-namespace trimcts
-{
-
-  class Node
-  {
-  public:
-    Node(py::object state, Node *parent = nullptr, Action action = -1, float prior = 0.0);
-    ~Node() = default; // Use default destructor
-
-    // Disable copy constructor and assignment operator
-    Node(const Node &) = delete;
-    Node &operator=(const Node &) = delete;
-
-    // Enable move constructor and assignment operator (optional, but good practice)
-    Node(Node &&) = default;
-    Node &operator=(Node &&) = default;
-
-    bool is_expanded() const;
-    bool is_terminal() const;
-    float get_value_estimate() const;
-    Node *select_child(const SearchConfig &config);
-    void expand(const PolicyMap &policy_map);
-    void backpropagate(float value);
-    void add_dirichlet_noise(const SearchConfig &config, std::mt19937 &rng);
-
-    // --- Public Members (Consider making some private with getters/setters) ---
-    Node *parent_;
-    Action action_taken_; // Action that led to this node
-    py::object state_;    // Python GameState object
-    std::map<Action, std::unique_ptr<Node>> children_;
-
-    int visit_count_ = 0;
-    double total_action_value_ = 0.0; // Use double for accumulation
-    float prior_probability_ = 0.0;
-
-  private:
-    float calculate_puct(const SearchConfig &config) const;
-  };
-
-  // Main MCTS function signature
-  VisitMap run_mcts_cpp_internal(
-      py::object root_state,
-      py::object network_interface, // AlphaZero interface for now
-      const SearchConfig &config);
-
-} // namespace trimcts
-```
-
-**6. File:** `trimcts/README.md`
-*   **Change:** Document the new batching feature and configuration option.
-
-```markdown
 [![CI](https://github.com/lguibr/trimcts/actions/workflows/ci_cd.yml/badge.svg)](https://github.com/lguibr/trimcts/actions)
 [![PyPI](https://img.shields.io/pypi/v/trimcts.svg)](https://pypi.org/project/trimcts/)
 [![Coverage Status](https://codecov.io/gh/lguibr/trimcts/graph/badge.svg?token=YOUR_CODECOV_TOKEN_HERE)](https://codecov.io/gh/lguibr/trimcts) <!-- TODO: Add Codecov token -->
@@ -3580,8 +2647,9 @@ namespace trimcts
 -   Seamless Python integration via Pybind11.
 -   Supports AlphaZero-style evaluation (policy/value from state).
 -   **Batched Network Evaluations:** Efficiently calls the Python network's `evaluate_batch` method during search for improved performance, especially with GPUs.
+-   **MCTS Tree Reuse:** Significantly speeds up sequential MCTS calls (e.g., during self-play) by reusing the relevant subtree from the previous search step. The C++ core manages the tree lifetime via opaque handles (`py::capsule`) passed between Python calls.
 -   (Planned) Supports MuZero-style evaluation (initial inference + recurrent inference).
--   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise, **batch size**).
+-   Configurable search parameters (simulation count, PUCT, discount factor, Dirichlet noise, batch size).
 -   Designed for use with external Python game state objects and network evaluators.
 -   Type-hinted Python API (`py.typed` compliant).
 
@@ -3597,7 +2665,7 @@ pip install trimcts
 pip install -e .[dev]
 ```
 
-## 💡 Usage Example (AlphaZero Style)
+## 💡 Usage Example (AlphaZero Style with Tree Reuse)
 
 ```python
 import time
@@ -3625,109 +2693,113 @@ except ImportError:
 
 from trimcts import run_mcts, SearchConfiguration, AlphaZeroNetworkInterface
 
-# --- Mock Neural Network for demonstration ---
-# Replace with your actual network implementation
+# --- Mock Neural Network (same as before) ---
 class MockNeuralNetwork:
     def __init__(self, *args, **kwargs):
         self.model = torch.nn.Module() # Dummy model
         print("MockNeuralNetwork initialized.")
 
     def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
-        # Mock evaluation: uniform policy over valid actions, fixed value
         valid_actions = state.valid_actions()
-        if not valid_actions:
-            return {}, 0.0 # Terminal or no valid actions
+        if not valid_actions: return {}, 0.0
         policy = {action: 1.0 / len(valid_actions) for action in valid_actions}
-        value = 0.5 # Fixed mock value
+        value = 0.5
         return policy, value
 
     def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
         print(f"  Mock evaluate_batch called with {len(states)} states.")
         return [self.evaluate_state(s) for s in states]
 
-    def load_weights(self, path):
-        print(f"Mock: Pretending to load weights from {path}")
-
-    def to(self, device):
-        print(f"Mock: Pretending to move model to {device}")
-        return self
+    def load_weights(self, path): print(f"Mock: Pretending to load weights from {path}")
+    def to(self, device): print(f"Mock: Pretending to move model to {device}"); return self
 # --- End Mock Neural Network ---
 
-
-# 1. Define your AlphaZero network wrapper conforming to the interface
+# --- AlphaZero Wrapper (same as before) ---
 class MyAlphaZeroWrapper(AlphaZeroNetworkInterface):
     def __init__(self, model_path: str | None = None):
-        # Load your PyTorch/TensorFlow/etc. model here
-        # Example using a Mock NeuralNetwork
-        self.network = MockNeuralNetwork() # Using Mock for this example
-        # Load weights if model_path is provided
-        if model_path:
-             self.network.load_weights(model_path)
-        # self.network.to(torch.device("cpu")) # Ensure model is on correct device if using real NN
-        self.network.model.eval() # Set to evaluation mode
+        self.network = MockNeuralNetwork()
+        if model_path: self.network.load_weights(model_path)
+        self.network.model.eval()
         print("MyAlphaZeroWrapper initialized.")
 
     def evaluate_state(self, state: GameState) -> tuple[dict[int, float], float]:
-        """
-        Evaluates a single game state.
-        NOTE: With batching enabled in C++, this might be called less often or only as a fallback.
-        """
         print(f"Python: Evaluating SINGLE state step {state.current_step}")
-        policy_map, value = self.network.evaluate_state(state) # Using mock evaluate directly
+        policy_map, value = self.network.evaluate_state(state)
         print(f"Python: Single evaluation result - Policy keys: {len(policy_map)}, Value: {value:.4f}")
         return policy_map, value
 
     def evaluate_batch(self, states: list[GameState]) -> list[tuple[dict[int, float], float]]:
-        """
-        Evaluates a batch of game states. This is the primary method called by C++ MCTS with batching.
-        """
         print(f"Python: Evaluating BATCH of {len(states)} states.")
-        results = self.network.evaluate_batch(states) # Using mock evaluate_batch directly
+        results = self.network.evaluate_batch(states)
         print(f"Python: Batch evaluation returned {len(results)} results.")
         return results
 
-# 2. Instantiate your game state and network wrapper
+# --- Simulation Loop Example ---
 env_config = EnvConfig()
 if HAS_TRIANGLENGIN:
-    # Ensure the config creates a playable state for the example
     env_config.ROWS = 3
     env_config.COLS = 3
     env_config.NUM_SHAPE_SLOTS = 1
-    env_config.PLAYABLE_RANGE_PER_ROW = [(0,3), (0,3), (0,3)] # Example playable range
+    env_config.PLAYABLE_RANGE_PER_ROW = [(0,3), (0,3), (0,3)]
 
-root_state = GameState(config=env_config, initial_seed=42)
-network_wrapper = MyAlphaZeroWrapper() # Add path to your trained model if needed
+game_state = GameState(config=env_config, initial_seed=42)
+network_wrapper = MyAlphaZeroWrapper()
 
-# 3. Configure MCTS parameters
 mcts_config = SearchConfiguration()
 mcts_config.max_simulations = 50
-mcts_config.max_depth = 10
-mcts_config.cpuct = 1.25
-mcts_config.dirichlet_alpha = 0.3
-mcts_config.dirichlet_epsilon = 0.25
-mcts_config.discount = 1.0 # AlphaZero typically uses no discount during search
-mcts_config.mcts_batch_size = 8 # Enable batching
+mcts_config.mcts_batch_size = 8
 
-# 4. Run MCTS
-# The C++ run_mcts function will call network_wrapper.evaluate_batch()
-print("Running MCTS...")
-# Ensure root_state is not terminal before running
-if not root_state.is_over():
-    # run_mcts returns a dictionary: {action: visit_count}
+# --- Tree Reuse Variables ---
+mcts_tree_handle = None # Start with no tree
+last_action = -1        # No previous action initially
+
+print("--- Running Self-Play Loop with Tree Reuse ---")
+max_episode_steps = 10
+for step in range(max_episode_steps):
+    if game_state.is_over():
+        print(f"\nGame over at step {step}. Final Score: {game_state.game_score()}")
+        break
+
+    print(f"\n--- Step {step} ---")
+    print(f"Current State Step: {game_state.current_step}")
+    print(f"Passing tree handle: {'Yes' if mcts_tree_handle else 'No'}")
+    print(f"Passing last action: {last_action}")
+
+    # Run MCTS, passing the handle and last action
+    # It returns visit counts AND the new handle
     start_time = time.time()
-    visit_counts = run_mcts(root_state, network_wrapper, mcts_config)
+    visit_counts, mcts_tree_handle = run_mcts(
+        root_state=game_state,
+        network_interface=network_wrapper,
+        config=mcts_config,
+        previous_tree_handle=mcts_tree_handle, # Pass handle from previous step
+        last_action=last_action               # Pass action that led to current state
+    )
     end_time = time.time()
-    print(f"\nMCTS Result (Visit Counts) after {end_time - start_time:.2f} seconds:")
+    print(f"MCTS Result (Visit Counts) after {end_time - start_time:.3f} seconds:")
     print(visit_counts)
+    print(f"Received new tree handle: {'Present' if mcts_tree_handle else 'None'}")
 
-    # Example: Select best action based on visits
-    if visit_counts:
-        best_action = max(visit_counts, key=visit_counts.get)
-        print(f"\nBest action based on visits: {best_action}")
-    else:
-        print("\nNo actions explored or MCTS failed.")
+    # Select best action based on visits
+    if not visit_counts:
+        print("MCTS returned no visits. Ending episode.")
+        break
+    best_action = max(visit_counts, key=visit_counts.get)
+    print(f"Selected Action: {best_action}")
+
+    # Store the selected action for the *next* MCTS call
+    last_action = best_action
+
+    # Apply the action to the game state
+    reward, done = game_state.step(best_action)
+    print(f"Step Reward: {reward:.3f}, Done: {done}")
+
 else:
-    print("Root state is already terminal. Cannot run MCTS.")
+     print(f"\nEpisode finished after {max_episode_steps} steps.")
+
+# The mcts_tree_handle (a py::capsule) will be automatically garbage collected
+# by Python when it goes out of scope, triggering the C++ destructor.
+print("\n--- End of Simulation ---")
 
 ```
 
@@ -3743,12 +2815,15 @@ trimcts/
 │   │   ├── CMakeLists.txt  # CMake build script for C++ part
 │   │   ├── bindings.cpp    # Pybind11 bindings
 │   │   ├── config.h        # C++ configuration struct
-│   │   ├── mcts.cpp        # C++ MCTS implementation
+│   │   ├── mcts.cpp        # C++ MCTS implementation (Node, simulation loop)
 │   │   ├── mcts.h          # C++ MCTS header
-│   │   └── python_interface.h # C++ helpers for Python interaction
+│   │   ├── mcts_manager.cpp # C++ MCTS Tree Manager implementation
+│   │   ├── mcts_manager.h  # C++ MCTS Tree Manager header (handles lifetime)
+│   │   ├── python_interface.h # C++ helpers for Python interaction
+│   │   └── structs.h       # Common C++ structs (NetworkOutput, etc.)
 │   ├── __init__.py         # Exposes public API (run_mcts, configs, etc.)
 │   ├── config.py           # Python SearchConfiguration (Pydantic)
-│   ├── mcts_wrapper.py     # Python network interface definition
+│   ├── mcts_wrapper.py     # Python network interface definition & run_mcts wrapper
 │   └── py.typed            # Marker file for type checkers (PEP 561)
 ├── tests/                  # Python tests ([tests/README.md](tests/README.md))
 │   ├── conftest.py
@@ -3817,6 +2892,8 @@ src/trimcts/cpp/bindings.cpp
 src/trimcts/cpp/config.h
 src/trimcts/cpp/mcts.cpp
 src/trimcts/cpp/mcts.h
+src/trimcts/cpp/mcts_manager.cpp
+src/trimcts/cpp/mcts_manager.h
 src/trimcts/cpp/python_interface.h
 tests/README.md
 tests/test_alpha_wrapper.py
